@@ -1,0 +1,30 @@
+# Experiment settings
+experiment_name: "resnet8_cifar10_baseline"
+seed: 42
+device: "cuda"  # or "cpu"
+
+# Data settings
+dataset: "cifar10"
+data_dir: "./data"
+num_workers: 4
+train_val_split: 0.9  # 90% train, 10% val from training set
+
+# Model settings
+model: "resnet8"
+num_classes: 10
+
+# Training settings
+batch_size: 128
+num_epochs: 200
+eval_every: 10  # Evaluate every N epochs
+
+# Optimizer settings (will override for each experiment)
+optimizer:
+  type: "sgd"  # or "adamw"
+  lr: 0.1
+  momentum: 0.9  # For SGD
+  weight_decay: 0.0001
+  # betas: [0.9, 0.999]  # For AdamW
+
+# Logging
+log_dir: "./experiments/logs"

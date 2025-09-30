@@ -1,4 +1,7 @@
 torch
-trackio
+torchvision
 numpy
+pyyaml
+trackio
+tqdm
 
