@@ -1,130 +1,215 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class BasicBlock(nn.Module):
-    """Basic ResNet block with 3x3 convolutions"""
+class PatchEmbedding(nn.Module):
+    """Convert image patches to embeddings"""
 
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(BasicBlock, self).__init__()
+    def __init__(self, img_size=32, patch_size=4, in_channels=3, embed_dim=192):
+        super(PatchEmbedding, self).__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
 
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        # Shortcut connection
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False), nn.BatchNorm2d(out_channels)
-            )
+        self.projection = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, x):
-        identity = self.shortcut(x)
-
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-
-        out += identity
-        out = F.relu(out)
-
-        return out
+        # x: (B, C, H, W) -> (B, embed_dim, H//patch_size, W//patch_size)
+        x = self.projection(x)
+        # Flatten spatial dimensions: (B, embed_dim, num_patches)
+        x = x.flatten(2)
+        # Transpose: (B, num_patches, embed_dim)
+        x = x.transpose(1, 2)
+        return x
 
 
-class ResNet8(nn.Module):
-    """ResNet-8 architecture for CIFAR-10
+class MultiHeadAttention(nn.Module):
+    """Multi-head self-attention mechanism"""
 
-    Architecture:
-    - Initial conv: 3 -> 16 channels
-    - Stage 1: 16 channels, 2 BasicBlocks (layers 1-2)
-    - Stage 2: 32 channels, 2 BasicBlocks (layers 3-4)
-    - Stage 3: 64 channels, 2 BasicBlocks (layers 5-6)
-    - avgpool + fc (layer 7)
+    def __init__(self, embed_dim=192, num_heads=3):
+        super(MultiHeadAttention, self).__init__()
+        assert embed_dim % num_heads == 0
 
-    Total: 1 (initial) + 6 (block convs) + 1 (fc) = 8 layers
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.scale = self.head_dim**-0.5
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        # Generate Q, K, V
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Attention
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        # Apply attention to values
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+
+        return x, attn  # Return attention weights for analysis
+
+
+class MLP(nn.Module):
+    """Feed-forward network"""
+
+    def __init__(self, embed_dim=192, mlp_ratio=4.0):
+        super(MLP, self).__init__()
+        hidden_dim = int(embed_dim * mlp_ratio)
+
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Transformer encoder block"""
+
+    def __init__(self, embed_dim=192, num_heads=3, mlp_ratio=4.0):
+        super(TransformerBlock, self).__init__()
+
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = MultiHeadAttention(embed_dim, num_heads)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.mlp = MLP(embed_dim, mlp_ratio)
+
+    def forward(self, x):
+        # Self-attention with residual connection
+        attn_input = self.norm1(x)
+        attn_output, attn_weights = self.attn(attn_input)
+        x = x + attn_output
+
+        # MLP with residual connection
+        mlp_input = self.norm2(x)
+        mlp_output = self.mlp(mlp_input)
+        x = x + mlp_output
+
+        return x, attn_weights
+
+
+class ViTTiny(nn.Module):
+    """Vision Transformer Tiny for CIFAR-10
+
+    Architecture optimized for Muon optimizer:
+    - Patch size: 4x4 (gives 8x8 = 64 patches for 32x32 images)
+    - Embed dim: 192
+    - Depth: 6 transformer blocks
+    - Heads: 3
+    - MLP ratio: 4
+    - Parameters: ~5.5M (mostly in linear layers, perfect for Muon)
     """
 
-    def __init__(self, num_classes=10):
-        super(ResNet8, self).__init__()
+    def __init__(self, img_size=32, patch_size=4, num_classes=10, embed_dim=192, depth=6, num_heads=3, mlp_ratio=4.0):
+        super(ViTTiny, self).__init__()
 
-        # Initial convolution
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(16)
+        self.patch_embed = PatchEmbedding(img_size, patch_size, 3, embed_dim)
+        num_patches = self.patch_embed.num_patches
 
-        # Stage 1: 16 channels, 2 blocks
-        self.stage1 = nn.Sequential(BasicBlock(16, 16, stride=1), BasicBlock(16, 16, stride=1))
+        # Learnable position embeddings
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
 
-        # Stage 2: 32 channels, 2 blocks
-        self.stage2 = nn.Sequential(
-            BasicBlock(16, 32, stride=2),  # Downsample
-            BasicBlock(32, 32, stride=1),
-        )
+        # Transformer blocks
+        self.blocks = nn.ModuleList([TransformerBlock(embed_dim, num_heads, mlp_ratio) for _ in range(depth)])
 
-        # Stage 3: 64 channels, 2 blocks
-        self.stage3 = nn.Sequential(
-            BasicBlock(32, 64, stride=2),  # Downsample
-            BasicBlock(64, 64, stride=1),
-        )
-
-        # Final layers
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(64, num_classes)
+        # Classification head
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, num_classes)
 
         # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize weights using standard ResNet initialization"""
+        """Initialize weights following ViT paper"""
+        # Initialize position embeddings
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        # Initialize linear layers
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
 
     def forward(self, x):
-        # Initial conv
-        x = F.relu(self.bn1(self.conv1(x)))
+        B = x.shape[0]
 
-        # Three stages
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
+        # Patch embedding
+        x = self.patch_embed(x)  # (B, num_patches, embed_dim)
 
-        # Final layers
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
+        # Add class token
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, embed_dim)
+        x = torch.cat([cls_tokens, x], dim=1)  # (B, num_patches + 1, embed_dim)
+
+        # Add position embeddings
+        x = x + self.pos_embed
+
+        # Apply transformer blocks
+        for block in self.blocks:
+            x, _ = block(x)
+
+        # Classification
+        x = self.norm(x)
+        cls_token_final = x[:, 0]  # Extract class token
+        x = self.head(cls_token_final)
 
         return x
 
     def get_features(self, x):
-        """Extract intermediate features for analysis (future use)"""
+        """Extract intermediate features for analysis"""
         features = {}
+        B = x.shape[0]
 
-        # Initial conv
-        x = F.relu(self.bn1(self.conv1(x)))
-        features["initial"] = x
+        # Patch embedding
+        x = self.patch_embed(x)
+        features["patch_embed"] = x.clone()
 
-        # Three stages
-        x = self.stage1(x)
-        features["stage1"] = x
+        # Add class token and position embeddings
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = x + self.pos_embed
+        features["pos_embed"] = x.clone()
 
-        x = self.stage2(x)
-        features["stage2"] = x
+        # Apply transformer blocks and collect intermediate features
+        attn_weights = []
+        for i, block in enumerate(self.blocks):
+            x, attn = block(x)
+            features[f"block_{i}"] = x.clone()
+            attn_weights.append(attn)
 
-        x = self.stage3(x)
-        features["stage3"] = x
+            # Store features at key layers
+            if i in [2, 5, 8, 11]:  # Quarter, half, 3/4, and final
+                features[f"block_{i}_detailed"] = {
+                    "tokens": x.clone(),
+                    "cls_token": x[:, 0].clone(),
+                    "patch_tokens": x[:, 1:].clone(),
+                    "attention_weights": attn,
+                }
 
-        # Final layers
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        features["avgpool"] = x
+        # Final features
+        x_norm = self.norm(x)
+        features["norm"] = x_norm.clone()
+        features["cls_token_final"] = x_norm[:, 0].clone()
 
-        x = self.fc(x)
-        features["output"] = x
+        # Classification
+        output = self.head(x_norm[:, 0])
+        features["output"] = output.clone()
+        features["attention_weights"] = attn_weights
 
-        return x, features
+        return output, features

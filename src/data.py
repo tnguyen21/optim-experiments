@@ -1,7 +1,6 @@
 import os
 import json
 import torch
-import numpy as np
 from torch.utils.data import DataLoader, Subset
 import torchvision
 import torchvision.transforms as transforms

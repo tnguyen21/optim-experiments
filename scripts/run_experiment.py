@@ -16,7 +16,7 @@ from datetime import datetime
 # Add src to path so we can import our modules
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from models import ResNet8
+from models import ViTTiny
 from data import get_cifar10_dataloaders
 from train import train
 from utils import set_seed, get_optimizer, setup_logging, save_final_model
@@ -27,7 +27,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run ResNet-8 CIFAR-10 experiment")
 
     parser.add_argument("--config", type=str, default="config/base_config.yaml", help="Path to config file")
-    parser.add_argument("--optimizer", type=str, choices=["sgd", "adamw"], help="Optimizer type (overrides config)")
+    parser.add_argument("--optimizer", type=str, choices=["sgd", "adamw", "muon"], help="Optimizer type (overrides config)")
     parser.add_argument("--lr", type=float, help="Learning rate (overrides config)")
     parser.add_argument("--seed", type=int, help="Random seed (overrides config)")
     parser.add_argument("--experiment-name", type=str, help="Experiment name (overrides config)")
@@ -51,12 +51,31 @@ def override_config(config, args):
         if args.optimizer == "adamw":
             config["optimizer"]["lr"] = args.lr if args.lr else 0.001
             config["optimizer"]["betas"] = [0.9, 0.999]
-            # Remove SGD-specific params
+            config["optimizer"]["weight_decay"] = 0.0001
+            # Remove SGD/Muon-specific params
             if "momentum" in config["optimizer"]:
                 del config["optimizer"]["momentum"]
+            if "nesterov" in config["optimizer"]:
+                del config["optimizer"]["nesterov"]
+            if "adjust_lr_fn" in config["optimizer"]:
+                del config["optimizer"]["adjust_lr_fn"]
         elif args.optimizer == "sgd":
             config["optimizer"]["lr"] = args.lr if args.lr else 0.1
             config["optimizer"]["momentum"] = 0.9
+            config["optimizer"]["weight_decay"] = 0.0001
+            # Remove AdamW/Muon-specific params
+            if "betas" in config["optimizer"]:
+                del config["optimizer"]["betas"]
+            if "nesterov" in config["optimizer"]:
+                del config["optimizer"]["nesterov"]
+            if "adjust_lr_fn" in config["optimizer"]:
+                del config["optimizer"]["adjust_lr_fn"]
+        elif args.optimizer == "muon":
+            config["optimizer"]["lr"] = args.lr if args.lr else 0.02  # Higher LR for Muon
+            config["optimizer"]["momentum"] = 0.95
+            config["optimizer"]["weight_decay"] = 0.1  # Higher weight decay for Muon
+            config["optimizer"]["nesterov"] = True
+            config["optimizer"]["adjust_lr_fn"] = "original"
             # Remove AdamW-specific params
             if "betas" in config["optimizer"]:
                 del config["optimizer"]["betas"]
@@ -108,8 +127,8 @@ def main():
     train_loader, val_loader, test_loader = get_cifar10_dataloaders(config)
 
     # Create model
-    print("Creating ResNet-8 model...")
-    model = ResNet8(num_classes=config["num_classes"])
+    print("Creating ViT-Tiny model...")
+    model = ViTTiny(num_classes=config["num_classes"])
 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
