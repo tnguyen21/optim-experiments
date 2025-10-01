@@ -122,7 +122,7 @@ def setup_logging(config):
     os.makedirs(results_dir, exist_ok=True)
 
     # Initialize trackio with project name and config
-    project_name = f"vit-tiny-cifar10-{config['optimizer']['type']}"
+    project_name = "vit-tiny-cifar10"
     trackio.init(
         project=project_name,
         config={
