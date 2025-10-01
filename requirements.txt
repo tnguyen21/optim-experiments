@@ -5,7 +5,10 @@ torchvision
 
 # Other dependencies
 numpy
+pandas
 pyyaml
 trackio
 tqdm
+matplotlib
+seaborn
 

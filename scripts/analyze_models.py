@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+Model Analysis Script for Optimizer Comparison
+
+Analyzes trained ViT-Tiny models to compare:
+1. Weight matrix effective ranks (via singular value entropy)
+2. Activation statistics and patterns
+3. Optimization behavior across different optimizers
+
+Usage:
+python scripts/analyze_models.py
+"""
+
+import os
+import sys
+import json
+from pathlib import Path
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+from tqdm import tqdm
+
+# Add src to path for imports
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
+from models import ViTTiny
+from data import get_cifar10_dataloaders
+
+
+def discover_trained_models(results_dir="experiments/results"):
+    """
+    Discover all trained models in the results directory
+
+    Returns:
+        List of dicts with model info: [{optimizer, lr, seed, model_path, metrics_path}, ...]
+    """
+    models = []
+    results_path = Path(results_dir)
+
+    if not results_path.exists():
+        print(f"Results directory not found: {results_dir}")
+        return models
+
+    # Find all experiment directories
+    for exp_dir in results_path.glob("*"):
+        if not exp_dir.is_dir():
+            continue
+
+        # Look for nested directory with same name (current structure)
+        nested_dir = exp_dir / exp_dir.name
+        if nested_dir.exists():
+            model_path = nested_dir / "final_model.pt"
+            metrics_path = nested_dir / "metrics.json"
+        else:
+            # Fallback to direct structure
+            model_path = exp_dir / "final_model.pt"
+            metrics_path = exp_dir / "metrics.json"
+
+        if model_path.exists() and metrics_path.exists():
+            # Parse experiment info from directory name
+            exp_name = exp_dir.name
+            parts = exp_name.split("_")
+
+            if len(parts) >= 4:  # Expected format: optimizer_lr{value}_seed{value}_{timestamp}
+                optimizer = parts[0]
+                lr_str = parts[1]  # lr{value}
+                seed_str = parts[2]  # seed{value}
+
+                try:
+                    lr = float(lr_str.replace("lr", ""))
+                    seed = int(seed_str.replace("seed", ""))
+
+                    models.append(
+                        {
+                            "optimizer": optimizer,
+                            "lr": lr,
+                            "seed": seed,
+                            "exp_name": exp_name,
+                            "model_path": str(model_path),
+                            "metrics_path": str(metrics_path),
+                        }
+                    )
+                except ValueError:
+                    print(f"Could not parse experiment name: {exp_name}")
+
+    print(f"Found {len(models)} trained models")
+    for model in models:
+        print(f"  {model['optimizer']} (lr={model['lr']}, seed={model['seed']})")
+
+    return models
+
+
+def load_model_and_metrics(model_info, device="cpu"):
+    """
+    Load a trained model and its metrics
+
+    Args:
+        model_info: Dict with model_path and metrics_path
+        device: Device to load model on
+
+    Returns:
+        (model, metrics) tuple
+    """
+    # Load metrics
+    with open(model_info["metrics_path"], "r") as f:
+        metrics = json.load(f)
+
+    # Create and load model
+    model = ViTTiny(num_classes=10)
+    state_dict = torch.load(model_info["model_path"], map_location=device)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    return model, metrics
+
+
+def compute_effective_rank(matrix):
+    """
+    Compute effective rank via singular value entropy
+
+    Args:
+        matrix: 2D tensor (weight matrix)
+
+    Returns:
+        Effective rank (float)
+    """
+    if matrix.dim() != 2:
+        raise ValueError(f"Expected 2D matrix, got {matrix.dim()}D")
+
+    # Compute SVD
+    U, S, V = torch.svd(matrix)
+
+    # Normalize singular values to create probability distribution
+    s_norm = S / S.sum()
+
+    # Compute entropy (with small epsilon to avoid log(0))
+    entropy = -(s_norm * torch.log(s_norm + 1e-10)).sum()
+
+    # Effective rank is exp(entropy)
+    return torch.exp(entropy).item()
+
+
+def analyze_model_weights(model):
+    """
+    Analyze weight matrices of the model
+
+    Returns:
+        Dict with effective ranks and singular values for each layer
+    """
+    weight_analysis = {}
+
+    for name, param in model.named_parameters():
+        if param.dim() == 2:  # Only 2D weight matrices
+            # Compute effective rank
+            eff_rank = compute_effective_rank(param.data)
+
+            # Compute singular values
+            U, S, V = torch.svd(param.data)
+            singular_values = S.detach().cpu().numpy()
+
+            weight_analysis[name] = {
+                "effective_rank": eff_rank,
+                "singular_values": singular_values.tolist(),
+                "shape": list(param.shape),
+                "num_params": param.numel(),
+            }
+
+    return weight_analysis
+
+
+def collect_activations(model, dataloader, device, num_batches=5):
+    """
+    Collect intermediate activations for analysis
+
+    Args:
+        model: The model to analyze
+        dataloader: DataLoader for input data
+        device: Device to run on
+        num_batches: Number of batches to process
+
+    Returns:
+        Dict of activations by layer name
+    """
+    activations = {}
+    hooks = []
+
+    def get_activation(name):
+        def hook(module, input, output):
+            # Store activation (detached to save memory)
+            if isinstance(output, tuple):
+                output = output[0]  # For attention layers that return (output, weights)
+            activations[name] = output.detach().cpu()
+
+        return hook
+
+    # Register hooks on key modules
+    for name, module in model.named_modules():
+        if any(layer_type in name for layer_type in ["attn", "mlp", "norm"]):
+            hooks.append(module.register_forward_hook(get_activation(name)))
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, (images, _) in enumerate(dataloader):
+            if batch_idx >= num_batches:
+                break
+
+            images = images.to(device)
+            _ = model(images)
+
+    # Remove hooks
+    for hook in hooks:
+        hook.remove()
+
+    return activations
+
+
+def compute_activation_stats(activations):
+    """
+    Compute statistics on collected activations
+
+    Returns:
+        Dict of statistics by layer
+    """
+    stats = {}
+
+    for name, acts in activations.items():
+        # Flatten all dimensions except the first (batch)
+        flat_acts = acts.flatten(1)
+
+        stats[name] = {
+            "mean_magnitude": acts.abs().mean().item(),
+            "sparsity": (acts.abs() < 0.01).float().mean().item(),
+            "variance": acts.var().item(),
+            "shape": list(acts.shape),
+            "num_activations": acts.numel(),
+        }
+
+        # Compute effective rank of activation covariance if feasible
+        if flat_acts.size(1) <= 10000:  # Avoid memory issues with very large matrices
+            try:
+                # Center the activations
+                centered = flat_acts - flat_acts.mean(dim=0, keepdim=True)
+                # Compute covariance matrix
+                cov = torch.mm(centered.t(), centered) / (centered.size(0) - 1)
+                # Effective rank of covariance
+                stats[name]["cov_effective_rank"] = compute_effective_rank(cov)
+            except Exception as e:
+                print(f"Could not compute covariance effective rank for {name}: {e}")
+                stats[name]["cov_effective_rank"] = None
+        else:
+            stats[name]["cov_effective_rank"] = None
+
+    return stats
+
+
+def plot_singular_value_spectra(results, output_dir):
+    """
+    Plot singular value spectra for key layers across optimizers
+    """
+    print("Generating singular value spectra plots...")
+
+    # Set style
+    plt.style.use("seaborn-v0_8")
+    sns.set_palette("Set2")
+
+    weight_analysis = results["weight_analysis"]
+
+    # Group by optimizer
+    by_optimizer = defaultdict(list)
+    for exp_name, analysis in weight_analysis.items():
+        optimizer = exp_name.split("_")[0]
+        by_optimizer[optimizer].append((exp_name, analysis))
+
+    # Get common layer names across all models
+    all_layer_names = set()
+    for exp_name, analysis in weight_analysis.items():
+        all_layer_names.update(analysis.keys())
+
+    # Focus on key transformer layers
+    key_layers = [name for name in all_layer_names if any(layer_type in name for layer_type in ["qkv", "proj", "fc1", "fc2", "head"])]
+
+    # Create subplots for key layers
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+
+    for idx, layer_name in enumerate(key_layers[:6]):  # Top 6 layers
+        ax = axes[idx]
+
+        for optimizer, models in by_optimizer.items():
+            # Collect singular values for this layer across seeds
+            all_sv = []
+            for exp_name, analysis in models:
+                if layer_name in analysis:
+                    sv = np.array(analysis[layer_name]["singular_values"])
+                    # Normalize and sort in descending order
+                    sv_norm = sv / sv.sum()
+                    sv_sorted = np.sort(sv_norm)[::-1]
+                    all_sv.append(sv_sorted)
+
+            if all_sv:
+                # Average across seeds (pad shorter sequences with zeros)
+                max_len = max(len(sv) for sv in all_sv)
+                padded = [np.pad(sv, (0, max_len - len(sv))) for sv in all_sv]
+                mean_sv = np.mean(padded, axis=0)
+                std_sv = np.std(padded, axis=0)
+
+                x = np.arange(len(mean_sv))
+                ax.plot(x, mean_sv, label=f"{optimizer}", linewidth=2)
+                ax.fill_between(x, mean_sv - std_sv, mean_sv + std_sv, alpha=0.3)
+
+        ax.set_title(f"Singular Value Spectrum: {layer_name}", fontsize=10)
+        ax.set_xlabel("Singular Value Index")
+        ax.set_ylabel("Normalized Singular Value")
+        ax.set_yscale("log")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    # Remove unused subplots
+    for idx in range(len(key_layers), len(axes)):
+        fig.delaxes(axes[idx])
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "singular_value_spectra.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_effective_ranks(results, output_dir):
+    """
+    Plot effective ranks by layer and optimizer
+    """
+    print("Generating effective rank comparison plots...")
+
+    weight_analysis = results["weight_analysis"]
+
+    # Collect data for plotting
+    data = []
+    for exp_name, analysis in weight_analysis.items():
+        optimizer = exp_name.split("_")[0]
+        for layer_name, layer_data in analysis.items():
+            data.append({"optimizer": optimizer, "layer": layer_name, "effective_rank": layer_data["effective_rank"], "exp_name": exp_name})
+
+    if not data:
+        print("No data for effective rank plots")
+        return
+
+    import pandas as pd
+
+    df = pd.DataFrame(data)
+
+    # Create subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Box plot by optimizer
+    sns.boxplot(data=df, x="optimizer", y="effective_rank", ax=ax1)
+    ax1.set_title("Effective Rank Distribution by Optimizer")
+    ax1.set_ylabel("Effective Rank")
+
+    # Heatmap by layer and optimizer
+    pivot_df = df.groupby(["layer", "optimizer"])["effective_rank"].mean().unstack()
+    sns.heatmap(pivot_df, annot=True, fmt=".2f", cmap="viridis", ax=ax2)
+    ax2.set_title("Mean Effective Rank by Layer and Optimizer")
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "effective_ranks.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_activation_statistics(results, output_dir):
+    """
+    Plot activation statistics across optimizers
+    """
+    print("Generating activation statistics plots...")
+
+    activation_analysis = results["activation_analysis"]
+
+    # Collect data
+    data = []
+    for exp_name, analysis in activation_analysis.items():
+        optimizer = exp_name.split("_")[0]
+        for layer_name, stats in analysis.items():
+            data.append(
+                {
+                    "optimizer": optimizer,
+                    "layer": layer_name,
+                    "mean_magnitude": stats["mean_magnitude"],
+                    "sparsity": stats["sparsity"],
+                    "variance": stats["variance"],
+                    "cov_effective_rank": stats.get("cov_effective_rank"),
+                    "exp_name": exp_name,
+                }
+            )
+
+    if not data:
+        print("No data for activation plots")
+        return
+
+    import pandas as pd
+
+    df = pd.DataFrame(data)
+
+    # Create subplots for different metrics
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # Mean magnitude
+    sns.boxplot(data=df, x="optimizer", y="mean_magnitude", ax=axes[0, 0])
+    axes[0, 0].set_title("Activation Mean Magnitude by Optimizer")
+    axes[0, 0].set_yscale("log")
+
+    # Sparsity
+    sns.boxplot(data=df, x="optimizer", y="sparsity", ax=axes[0, 1])
+    axes[0, 1].set_title("Activation Sparsity by Optimizer")
+
+    # Variance
+    sns.boxplot(data=df, x="optimizer", y="variance", ax=axes[1, 0])
+    axes[1, 0].set_title("Activation Variance by Optimizer")
+    axes[1, 0].set_yscale("log")
+
+    # Effective rank of covariance (if available)
+    df_cov = df.dropna(subset=["cov_effective_rank"])
+    if not df_cov.empty:
+        sns.boxplot(data=df_cov, x="optimizer", y="cov_effective_rank", ax=axes[1, 1])
+        axes[1, 1].set_title("Activation Covariance Effective Rank by Optimizer")
+    else:
+        axes[1, 1].text(0.5, 0.5, "No covariance data available", ha="center", va="center", transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title("Activation Covariance Effective Rank")
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "activation_statistics.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def create_summary_table(results, output_dir):
+    """
+    Create a summary comparison table
+    """
+    print("Creating summary comparison table...")
+
+    # Aggregate results by optimizer
+    summary = defaultdict(lambda: defaultdict(list))
+
+    # Weight analysis summary
+    for exp_name, analysis in results["weight_analysis"].items():
+        optimizer = exp_name.split("_")[0]
+
+        effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+        summary[optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks))
+        summary[optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks))
+
+    # Activation analysis summary
+    for exp_name, analysis in results["activation_analysis"].items():
+        optimizer = exp_name.split("_")[0]
+
+        magnitudes = [stats["mean_magnitude"] for stats in analysis.values()]
+        sparsities = [stats["sparsity"] for stats in analysis.values()]
+        variances = [stats["variance"] for stats in analysis.values()]
+
+        summary[optimizer]["activation_magnitude_mean"].append(np.mean(magnitudes))
+        summary[optimizer]["activation_sparsity_mean"].append(np.mean(sparsities))
+        summary[optimizer]["activation_variance_mean"].append(np.mean(variances))
+
+    # Create final summary
+    final_summary = {}
+    for optimizer, metrics in summary.items():
+        final_summary[optimizer] = {}
+        for metric, values in metrics.items():
+            final_summary[optimizer][f"{metric}_across_seeds"] = {"mean": float(np.mean(values)), "std": float(np.std(values))}
+
+    # Save summary
+    with open(output_dir / "summary_table.json", "w") as f:
+        json.dump(final_summary, f, indent=2)
+
+    # Print summary
+    print("\n" + "=" * 60)
+    print("SUMMARY COMPARISON")
+    print("=" * 60)
+
+    for optimizer in sorted(final_summary.keys()):
+        print(f"\n{optimizer.upper()}:")
+        metrics = final_summary[optimizer]
+
+        if "weight_effective_rank_mean_across_seeds" in metrics:
+            eff_rank = metrics["weight_effective_rank_mean_across_seeds"]
+            print(f"  Weight Effective Rank: {eff_rank['mean']:.3f} ± {eff_rank['std']:.3f}")
+
+        if "activation_sparsity_mean_across_seeds" in metrics:
+            sparsity = metrics["activation_sparsity_mean_across_seeds"]
+            print(f"  Activation Sparsity: {sparsity['mean']:.3f} ± {sparsity['std']:.3f}")
+
+        if "activation_variance_mean_across_seeds" in metrics:
+            variance = metrics["activation_variance_mean_across_seeds"]
+            print(f"  Activation Variance: {variance['mean']:.6f} ± {variance['std']:.6f}")
+
+
+def main():
+    """Main analysis function"""
+    print("Starting model analysis...")
+
+    # Setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Create output directory
+    output_dir = Path("analysis")
+    output_dir.mkdir(exist_ok=True)
+
+    # Discover trained models
+    models = discover_trained_models()
+    if not models:
+        print("No trained models found!")
+        return
+
+    # Storage for all analysis results
+    all_results = {"weight_analysis": {}, "activation_analysis": {}, "model_info": models}
+
+    # Load test data for activation analysis (we'll use a consistent subset)
+    print("Loading test dataset...")
+    config = {
+        "data_dir": "data",
+        "batch_size": 32,
+        "num_workers": 0,  # Avoid multiprocessing issues
+        "train_val_split": 0.8,
+        "seed": 42,
+        "log_dir": "temp",  # Won't be used
+    }
+    _, _, test_loader = get_cifar10_dataloaders(config)
+
+    # Analyze each model
+    for model_info in tqdm(models, desc="Analyzing models"):
+        exp_name = model_info["exp_name"]
+        # optimizer = model_info['optimizer']
+
+        print(f"\nAnalyzing {exp_name}...")
+
+        try:
+            # Load model
+            model, metrics = load_model_and_metrics(model_info, device)
+
+            # Analyze weights
+            print("  Computing weight matrix effective ranks...")
+            weight_analysis = analyze_model_weights(model)
+            all_results["weight_analysis"][exp_name] = weight_analysis
+
+            # Analyze activations
+            print("  Collecting and analyzing activations...")
+            activations = collect_activations(model, test_loader, device)
+            activation_stats = compute_activation_stats(activations)
+            all_results["activation_analysis"][exp_name] = activation_stats
+
+            print(f"  ✓ Analysis complete for {exp_name}")
+
+        except Exception as e:
+            print(f"  ✗ Error analyzing {exp_name}: {e}")
+            continue
+
+    # Save results
+    results_file = output_dir / "analysis_results.json"
+    print(f"\nSaving results to {results_file}...")
+
+    with open(results_file, "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    # Generate visualizations
+    print("\nGenerating visualizations...")
+    try:
+        plot_singular_value_spectra(all_results, output_dir)
+        plot_effective_ranks(all_results, output_dir)
+        plot_activation_statistics(all_results, output_dir)
+        create_summary_table(all_results, output_dir)
+        print("✓ Visualizations complete!")
+    except Exception as e:
+        print(f"Warning: Could not generate some visualizations: {e}")
+
+    print("✓ Analysis complete!")
+    print(f"Results saved to: {results_file}")
+    print(f"Visualizations saved to: {output_dir}")
+
+    return all_results
+
+
+if __name__ == "__main__":
+    results = main()
