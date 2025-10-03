@@ -16,6 +16,7 @@ import sys
 import json
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -255,6 +256,70 @@ def compute_activation_stats(activations):
     return stats
 
 
+def compute_class_representation_similarity(model, dataloader, device, num_batches=None, representation="cls_token"):
+    """Compute class-level representation statistics for covariance plots"""
+
+    model.eval()
+    num_classes = model.head.out_features
+    rep_dim = model.head.in_features
+
+    class_sum = torch.zeros(num_classes, rep_dim, device=device)
+    class_count = torch.zeros(num_classes, device=device)
+
+    batches_processed = 0
+    seen_classes = set()
+
+    with torch.no_grad():
+        for images, labels in dataloader:
+            if num_batches is not None and batches_processed >= num_batches and len(seen_classes) == num_classes:
+                break
+
+            images = images.to(device)
+            labels = labels.to(device)
+
+            _, features = model.get_features(images)
+
+            if representation == "cls_token":
+                reps = features["cls_token_final"]
+            elif representation == "mean_patch":
+                patches = features["norm"][:, 1:]
+                reps = patches.mean(dim=1)
+            else:
+                raise ValueError(f"Unsupported representation type: {representation}")
+
+            class_sum.index_add_(0, labels, reps)
+            class_count.index_add_(0, labels, torch.ones(labels.size(0), device=device))
+
+            seen_classes.update(labels.tolist())
+            batches_processed += 1
+
+    nonzero_mask = class_count > 0
+    if not nonzero_mask.all():
+        missing = (~nonzero_mask).nonzero(as_tuple=False).flatten().tolist()
+        print(f"Warning: Missing samples for classes {missing}; covariance stats may be incomplete")
+
+    safe_counts = class_count.clone()
+    safe_counts[~nonzero_mask] = 1.0
+
+    class_means = class_sum / safe_counts.unsqueeze(1)
+    class_means[~nonzero_mask] = 0.0
+
+    cosine_sim = F.cosine_similarity(class_means.unsqueeze(1), class_means.unsqueeze(0), dim=2)
+
+    try:
+        covariance = torch.cov(class_means.T)
+    except RuntimeError:
+        covariance = torch.zeros(num_classes, num_classes, device=device)
+
+    return {
+        "representation": representation,
+        "class_means": class_means.cpu().tolist(),
+        "class_counts": [int(c.item()) for c in class_count.cpu()],
+        "cosine_similarity": cosine_sim.cpu().tolist(),
+        "covariance": covariance.cpu().tolist(),
+    }
+
+
 def plot_singular_value_spectra(results, output_dir):
     """
     Plot singular value spectra for key layers across optimizers
@@ -417,17 +482,49 @@ def plot_activation_statistics(results, output_dir):
     axes[1, 0].set_title("Activation Variance by Optimizer")
     axes[1, 0].set_yscale("log")
 
-    # Effective rank of covariance (if available)
-    df_cov = df.dropna(subset=["cov_effective_rank"])
-    if not df_cov.empty:
-        sns.boxplot(data=df_cov, x="optimizer", y="cov_effective_rank", ax=axes[1, 1])
-        axes[1, 1].set_title("Activation Covariance Effective Rank by Optimizer")
-    else:
-        axes[1, 1].text(0.5, 0.5, "No covariance data available", ha="center", va="center", transform=axes[1, 1].transAxes)
-        axes[1, 1].set_title("Activation Covariance Effective Rank")
-
     plt.tight_layout()
     plt.savefig(output_dir / "activation_statistics.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_class_similarity_heatmaps(results, output_dir):
+    """Plot class-level cosine similarity heatmaps across optimizers"""
+    print("Generating class covariance plots...")
+
+    class_similarity = results.get("class_similarity", {})
+
+    if not class_similarity:
+        print("No class similarity data for covariance plots")
+        return
+
+    by_optimizer = defaultdict(list)
+    for exp_name, stats in class_similarity.items():
+        optimizer = exp_name.split("_")[0]
+
+        if "cosine_similarity" in stats:
+            by_optimizer[optimizer].append(np.array(stats["cosine_similarity"]))
+
+    if not by_optimizer:
+        print("No cosine similarity matrices found")
+        return
+
+    optimizers = sorted(by_optimizer.keys())
+    fig, axes = plt.subplots(1, len(optimizers), figsize=(6 * len(optimizers), 5), squeeze=False)
+
+    vmin, vmax = -1.0, 1.0
+
+    for idx, optimizer in enumerate(optimizers):
+        matrices = by_optimizer[optimizer]
+        mean_matrix = np.mean(matrices, axis=0)
+
+        ax = axes[0, idx]
+        sns.heatmap(mean_matrix, ax=ax, cmap="coolwarm", vmin=vmin, vmax=vmax, square=True, cbar=idx == len(optimizers) - 1)
+        ax.set_title(f"{optimizer.title()} Class Similarity")
+        ax.set_xlabel("Class")
+        ax.set_ylabel("Class")
+
+    plt.tight_layout()
+    plt.savefig(output_dir / "class_similarity_heatmaps.png", dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -512,7 +609,7 @@ def main():
         return
 
     # Storage for all analysis results
-    all_results = {"weight_analysis": {}, "activation_analysis": {}, "model_info": models}
+    all_results = {"weight_analysis": {}, "activation_analysis": {}, "class_similarity": {}, "model_info": models}
 
     # Load test data for activation analysis (we'll use a consistent subset)
     print("Loading test dataset...")
@@ -548,6 +645,10 @@ def main():
             activation_stats = compute_activation_stats(activations)
             all_results["activation_analysis"][exp_name] = activation_stats
 
+            print("  Computing class covariance statistics...")
+            class_stats = compute_class_representation_similarity(model, test_loader, device)
+            all_results["class_similarity"][exp_name] = class_stats
+
             print(f"  ✓ Analysis complete for {exp_name}")
 
         except Exception as e:
@@ -567,6 +668,7 @@ def main():
         plot_singular_value_spectra(all_results, output_dir)
         plot_effective_ranks(all_results, output_dir)
         plot_activation_statistics(all_results, output_dir)
+        plot_class_similarity_heatmaps(all_results, output_dir)
         create_summary_table(all_results, output_dir)
         print("✓ Visualizations complete!")
     except Exception as e:
