@@ -466,21 +466,21 @@ def plot_activation_statistics(results, output_dir):
     df = pd.DataFrame(data)
 
     # Create subplots for different metrics
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
     # Mean magnitude
-    sns.boxplot(data=df, x="optimizer", y="mean_magnitude", ax=axes[0, 0])
-    axes[0, 0].set_title("Activation Mean Magnitude by Optimizer")
-    axes[0, 0].set_yscale("log")
+    sns.boxplot(data=df, x="optimizer", y="mean_magnitude", ax=axes[0])
+    axes[0].set_title("Activation Mean Magnitude by Optimizer")
+    axes[0].set_yscale("log")
 
     # Sparsity
-    sns.boxplot(data=df, x="optimizer", y="sparsity", ax=axes[0, 1])
-    axes[0, 1].set_title("Activation Sparsity by Optimizer")
+    sns.boxplot(data=df, x="optimizer", y="sparsity", ax=axes[1])
+    axes[1].set_title("Activation Sparsity by Optimizer")
 
     # Variance
-    sns.boxplot(data=df, x="optimizer", y="variance", ax=axes[1, 0])
-    axes[1, 0].set_title("Activation Variance by Optimizer")
-    axes[1, 0].set_yscale("log")
+    sns.boxplot(data=df, x="optimizer", y="variance", ax=axes[2])
+    axes[2].set_title("Activation Variance by Optimizer")
+    axes[2].set_yscale("log")
 
     plt.tight_layout()
     plt.savefig(output_dir / "activation_statistics.png", dpi=300, bbox_inches="tight")
