@@ -192,6 +192,7 @@ wandb/
 mlruns/
 .neptune/
 analysis/
+temp/
 
 # Temporary files
 *.tmp
