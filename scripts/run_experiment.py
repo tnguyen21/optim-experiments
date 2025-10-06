@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 import yaml
+import trackio
 from datetime import datetime
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -136,8 +137,6 @@ def main():
 
     results_path = os.path.join(results_dir, experiment_name)
     save_final_model(model, results_path, final_metrics)
-
-    import trackio
 
     trackio.finish()
 
