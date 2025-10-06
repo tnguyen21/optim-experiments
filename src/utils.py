@@ -14,7 +14,6 @@ def set_seed(seed):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Ensure deterministic behavior
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -50,7 +49,6 @@ def get_optimizer(model, config):
             else:  # Conv layers (4D), biases (1D), batch norm (1D)
                 adamw_params.append(param)
 
-        # Print parameter distribution for transparency
         muon_param_count = sum(p.numel() for p in muon_params)
         adamw_param_count = sum(p.numel() for p in adamw_params)
         total_params = muon_param_count + adamw_param_count
@@ -60,7 +58,6 @@ def get_optimizer(model, config):
         print(f"  AdamW (other params): {adamw_param_count:,} parameters ({100 * adamw_param_count / total_params:.1f}%)")
 
         if not muon_params:
-            # Fallback to AdamW if no 2D parameters
             print("Warning: No 2D parameters found for Muon, using AdamW for all parameters")
             return torch.optim.AdamW(
                 model.parameters(),
@@ -68,7 +65,6 @@ def get_optimizer(model, config):
                 weight_decay=optimizer_config.get("weight_decay", 0.1),
             )
 
-        # Use a wrapper to handle mixed optimizers
         from torch.optim import Muon, AdamW
 
         optimizers = []
@@ -91,7 +87,6 @@ def get_optimizer(model, config):
             )
             optimizers.append(("adamw", adamw_opt))
 
-        # Create a simple wrapper class for mixed optimizers
         class MixedOptimizer:
             def __init__(self, optimizers):
                 self.optimizers = optimizers
@@ -114,14 +109,12 @@ def get_optimizer(model, config):
 
 def setup_logging(config):
     """Setup Trackio logging and create directories"""
-    # Create log and results directories
     log_dir = config["log_dir"]
     results_dir = log_dir.replace("logs", "results")
 
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
-    # Initialize trackio with project name and config
     project_name = "vit-tiny-cifar10"
     trackio.init(
         project=project_name,
@@ -140,14 +133,11 @@ def setup_logging(config):
 
 def save_final_model(model, filepath, metrics):
     """Save final model weights and summary metrics"""
-    # Create directory if it doesn't exist
     os.makedirs(filepath, exist_ok=True)
 
-    # Save model weights
     model_path = os.path.join(filepath, "final_model.pt")
     torch.save(model.state_dict(), model_path)
 
-    # Save metrics
     metrics_path = os.path.join(filepath, "metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)

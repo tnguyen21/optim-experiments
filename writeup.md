@@ -33,28 +33,21 @@ Our Muon-ViT achieved a test accuracy of ~37%, compared to ~29% accuracy of Adam
 This result needs to be taken with a grain of salt; we have not tuned hyperparameters for every optimizer and analyzed training dynamics across multiple seeds.
 
 TOOD:
-- tune hparams for all optimizers
+- tune hparams for all 
 - train across different seeds; confirm trend is robust and not spurious
 - train for longer; checkpoint model between epochs and examine how rank and activation distribution changes across epochs for every optimizer
-- add covariance plot of intermediate activations
-  - start with computing vectors prior to the final layer in the ViT
-  - maybe extend to all layers to observe differences between layers
 - examine rank and activation sparsity across model sizes trained
 - examine rank and activation sparsity on different difficulty of tasks (e.g. MNIST vs CIFAR-10 vs CIFAR-100)
 - better understand theoretical foundations of first-order and second-order optimizations
 
 ## covariance notes:
 
-```
 In the covariance/cosine similarity heatmap (Figure 4, right), they're computing similarity between class-specific representations. Here's the process:
 
 Take the hidden layer activations (the intermediate representations in the MLP)
 For each class, collect all activations for samples from that class
 Compute a representative vector per class (likely the mean activation across all samples of that class)
 Calculate pairwise cosine similarity between these class representatives
-```
-```
-```
 
 
 For a ViT, I'd recommend:
@@ -62,7 +55,6 @@ For a ViT, I'd recommend:
 Primary choice: CLS token or mean-pooled patch tokens from the last layer before the classification head
 Alternative: All patch token activations from the final transformer block
 
-```
 ```
 # For ViT - Option 1: CLS token
 cls_tokens = model.get_cls_tokens()  # [batch, hidden_dim]
@@ -74,4 +66,33 @@ acts_flat = patch_tokens.reshape(-1, hidden_dim)
 cov = torch.cov(acts_flat.T)
 ```
 
+```
+# Step 1: Collect class-representative vectors
+class_representatives = []
 
+for class_idx in range(num_classes):
+    # Get all samples from this class
+    class_samples = dataset[dataset.labels == class_idx]
+    
+    # Forward pass to get activations
+    with torch.no_grad():
+        activations = model.get_intermediate_activations(class_samples)
+        # Shape: [num_samples_in_class, hidden_dim]
+    
+    # Compute mean activation for this class
+    class_mean = activations.mean(dim=0)  # [hidden_dim]
+    class_representatives.append(class_mean)
+
+# Step 2: Compute pairwise cosine similarity
+class_reps = torch.stack(class_representatives)  # [num_classes, hidden_dim]
+
+# Compute cosine similarity matrix [num_classes, num_classes]
+cosine_sim = F.cosine_similarity(
+    class_reps.unsqueeze(1),  # [num_classes, 1, hidden_dim]
+    class_reps.unsqueeze(0),  # [1, num_classes, hidden_dim]
+    dim=2
+)
+
+# Now plot this as a heatmap!
+plt.imshow(cosine_sim.cpu().numpy())
+```
