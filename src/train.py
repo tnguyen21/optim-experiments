@@ -21,22 +21,18 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
     for batch_idx, (data, targets) in enumerate(pbar):
         data, targets = data.to(device), targets.to(device)
 
-        # Forward pass
         optimizer.zero_grad()
         outputs = model(data)
         loss = criterion(outputs, targets)
 
-        # Backward pass
         loss.backward()
         optimizer.step()
 
-        # Statistics
         running_loss += loss.item()
         _, predicted = outputs.max(1)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
 
-        # Update progress bar
         pbar.set_postfix({"Loss": f"{running_loss / (batch_idx + 1):.4f}", "Acc": f"{100.0 * correct / total:.2f}%"})
 
     avg_loss = running_loss / len(train_loader)
@@ -71,7 +67,6 @@ def validate(model, val_loader, criterion, device):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            # Update progress bar
             pbar.set_postfix({"Loss": f"{running_loss / (batch_idx + 1):.4f}", "Acc": f"{100.0 * correct / total:.2f}%"})
 
     avg_loss = running_loss / len(val_loader)
@@ -101,17 +96,13 @@ def train(model, train_loader, val_loader, test_loader, optimizer, config):
     final_metrics = {}
 
     for epoch in range(num_epochs):
-        # Train for one epoch
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
 
-        # Log training metrics
         trackio.log({"epoch": epoch + 1, "train_loss": train_loss, "train_acc": train_acc})
 
-        # Validate periodically
         if (epoch + 1) % eval_every == 0 or epoch == num_epochs - 1:
             val_loss, val_acc = validate(model, val_loader, criterion, device)
 
-            # Log validation metrics
             trackio.log({"epoch": epoch + 1, "val_loss": val_loss, "val_acc": val_acc})
 
             print(
@@ -120,22 +111,18 @@ def train(model, train_loader, val_loader, test_loader, optimizer, config):
                 f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%"
             )
 
-            # Track best validation accuracy
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
         else:
             print(f"Epoch {epoch + 1}/{num_epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
 
-    # Final test evaluation
     print("\nEvaluating on test set...")
     test_loss, test_acc = validate(model, test_loader, criterion, device)
 
-    # Log final test metrics
     trackio.log({"epoch": num_epochs, "test_loss": test_loss, "test_acc": test_acc})
 
     print(f"Final Test Results: Loss: {test_loss:.4f}, Acc: {test_acc:.2f}%")
 
-    # Compile final metrics
     final_metrics = {
         "final_train_loss": train_loss,
         "final_train_acc": train_acc,

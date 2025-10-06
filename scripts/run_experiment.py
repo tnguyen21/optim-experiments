@@ -13,7 +13,6 @@ import sys
 import yaml
 from datetime import datetime
 
-# Add src to path so we can import our modules
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from models import ViTTiny
@@ -103,54 +102,41 @@ def create_experiment_name(config):
 
 
 def main():
-    # Parse arguments
     args = parse_args()
 
-    # Load and override config
     config = load_config(args.config)
     config = override_config(config, args)
 
-    # Create unique experiment name
     experiment_name = create_experiment_name(config)
 
-    # Update log directory with experiment name
     config["log_dir"] = os.path.join(config["log_dir"], experiment_name)
 
     print(f"Starting experiment: {experiment_name}")
     print(f"Config: {config}")
 
-    # Set all random seeds for reproducibility
     set_seed(config["seed"])
 
-    # Create dataloaders
     print("Loading CIFAR-10 dataset...")
     train_loader, val_loader, test_loader = get_cifar10_dataloaders(config)
 
-    # Create model
     print("Creating ViT-Tiny model...")
     model = ViTTiny(num_classes=config["num_classes"])
 
-    # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
 
-    # Create optimizer
     optimizer = get_optimizer(model, config)
     print(f"Using optimizer: {optimizer}")
 
-    # Setup logging
     results_dir = setup_logging(config)
 
-    # Train the model
     print("Starting training...")
     final_metrics = train(model, train_loader, val_loader, test_loader, optimizer, config)
 
-    # Save final model and results
     results_path = os.path.join(results_dir, experiment_name)
     save_final_model(model, results_path, final_metrics)
 
-    # Finish trackio logging
     import trackio
 
     trackio.finish()
