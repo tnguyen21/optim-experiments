@@ -6,7 +6,7 @@
 set -e  # Exit on any error
 
 # Configuration
-SEEDS=(42 123 456)
+SEEDS=(42 123 456 314 2718)
 OPTIMIZERS=("sgd" "adamw" "muon")
 CONFIG_FILE="config/base_config.yaml"
 
