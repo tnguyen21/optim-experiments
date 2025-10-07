@@ -99,6 +99,28 @@ def get_optimizer(model, config):
                 for _, opt in self.optimizers:
                     opt.step()
 
+            def state_dict(self):
+                """Return state dictionaries from all wrapped optimizers"""
+                state_dict = {}
+                for name, opt in self.optimizers:
+                    state_dict[name] = opt.state_dict()
+                return state_dict
+
+            def load_state_dict(self, state_dict):
+                """Load state dictionaries into all wrapped optimizers"""
+                for name, opt in self.optimizers:
+                    if name in state_dict:
+                        opt.load_state_dict(state_dict[name])
+
+            @property
+            def param_groups(self):
+                """Return combined param_groups from all wrapped optimizers"""
+                combined_groups = []
+                for _, opt in self.optimizers:
+                    if hasattr(opt, "param_groups"):
+                        combined_groups.extend(opt.param_groups)
+                return combined_groups
+
             def __repr__(self):
                 return f"MixedOptimizer({dict(self.optimizers)})"
 
