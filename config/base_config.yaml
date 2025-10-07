@@ -1,4 +1,9 @@
-# Experiment settings
+# Base Configuration Template
+# For optimal performance, use optimizer-specific configs:
+# - sgd_optimal_config.yaml (LR: 0.1, Val Acc: ~54%)
+# - adamw_optimal_config.yaml (LR: 0.001, Val Acc: ~71%) 
+# - muon_optimal_config.yaml (LR: 0.01, Val Acc: ~76%)
+
 experiment_name: "vit_tiny_cifar10_baseline"
 seed: 42
 device: "cuda"  # or "cpu"
@@ -6,7 +11,7 @@ device: "cuda"  # or "cpu"
 # Data settings
 dataset: "cifar10"
 data_dir: "./data"
-num_workers: 4
+num_workers: 8
 train_val_split: 0.9  # 90% train, 10% val from training set
 
 # Model settings
@@ -14,19 +19,21 @@ model: "vit_tiny"
 num_classes: 10
 
 # Training settings
-batch_size: 128
-num_epochs: 200
-eval_every: 999999  # Evaluate every N epochs (set to large number to disable by default)
+batch_size: 4096  # Learning rates below optimized for this batch size
+num_epochs: 150
+eval_every: 10  # Evaluate every N epochs
 
-# Optimizer settings (will override for each experiment)
+# Optimizer settings
+# NOTE: Learning rates optimized via LR sweep for batch size 4096
+# Use optimizer-specific configs for best performance
 optimizer:
-  type: "sgd"  # Options: "sgd", "adamw", "muon"
-  lr: 0.1
-  momentum: 0.9  # For SGD
-  weight_decay: 0.0001
-  # betas: [0.9, 0.999]  # For AdamW
-  # nesterov: true  # For Muon
-  # adjust_lr_fn: "original"  # For Muon: "original" or "match_rms_adamw"
+  type: "muon"  # Best performing: "muon" > "adamw" > "sgd"
+  lr: 0.01      # Optimal LR for Muon at batch size 4096
+  momentum: 0.95  # For SGD and Muon
+  weight_decay: 0.1  # Higher for Muon (0.0001 for SGD/AdamW)
+  betas: [0.9, 0.999]  # For AdamW
+  nesterov: true  # For Muon
+  adjust_lr_fn: "original"  # For Muon: "original" or "match_rms_adamw"
 
 # Logging
 log_dir: "./experiments/logs"

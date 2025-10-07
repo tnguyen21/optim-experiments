@@ -1,0 +1,31 @@
+# SGD Optimal Configuration
+# Learning rate optimized for batch size 4096 based on LR sweep results
+# Best validation accuracy: 53.97%
+experiment_name: "vit_tiny_cifar10_sgd_optimal"
+seed: 42
+device: "cuda"  # or "cpu"
+
+# Data settings
+dataset: "cifar10"
+data_dir: "./data"
+num_workers: 8
+train_val_split: 0.9  # 90% train, 10% val from training set
+
+# Model settings
+model: "vit_tiny"
+num_classes: 10
+
+# Training settings
+batch_size: 4096  # Optimized for this batch size
+num_epochs: 150
+eval_every: 10  # Evaluate every N epochs
+
+# SGD Optimizer settings (optimized via LR sweep)
+optimizer:
+  type: "sgd"
+  lr: 0.1  # Optimal LR found via sweep for batch size 4096
+  momentum: 0.9
+  weight_decay: 0.0001
+
+# Logging
+log_dir: "./experiments/logs"
