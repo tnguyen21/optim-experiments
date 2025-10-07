@@ -1,7 +1,23 @@
-import torch
-import torch.nn as nn
-from tqdm import tqdm
+import time
 import trackio
+import torch
+
+
+def get_learning_rate(optimizer):
+    """Return the learning rate for the first optimizer param group."""
+    if hasattr(optimizer, "param_groups"):
+        if optimizer.param_groups:
+            return optimizer.param_groups[0].get("lr")
+        return None
+
+    if hasattr(optimizer, "optimizers"):
+        # Mixed optimizer case; return the first available lr
+        for _, opt in optimizer.optimizers:
+            lr = get_learning_rate(opt)
+            if lr is not None:
+                return lr
+
+    return None
 
 
 def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
@@ -16,9 +32,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
     correct = 0
     total = 0
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Train]")
-
-    for batch_idx, (data, targets) in enumerate(pbar):
+    for data, targets in train_loader:
         data, targets = data.to(device), targets.to(device)
 
         optimizer.zero_grad()
@@ -32,8 +46,6 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
         _, predicted = outputs.max(1)
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
-
-        pbar.set_postfix({"Loss": f"{running_loss / (batch_idx + 1):.4f}", "Acc": f"{100.0 * correct / total:.2f}%"})
 
     avg_loss = running_loss / len(train_loader)
     avg_acc = 100.0 * correct / total
@@ -54,9 +66,7 @@ def validate(model, val_loader, criterion, device):
     total = 0
 
     with torch.no_grad():
-        pbar = tqdm(val_loader, desc="Validation")
-
-        for batch_idx, (data, targets) in enumerate(pbar):
+        for data, targets in val_loader:
             data, targets = data.to(device), targets.to(device)
 
             outputs = model(data)
@@ -66,8 +76,6 @@ def validate(model, val_loader, criterion, device):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-
-            pbar.set_postfix({"Loss": f"{running_loss / (batch_idx + 1):.4f}", "Acc": f"{100.0 * correct / total:.2f}%"})
 
     avg_loss = running_loss / len(val_loader)
     avg_acc = 100.0 * correct / total
@@ -84,7 +92,7 @@ def train(model, train_loader, val_loader, test_loader, optimizer, config):
     device = torch.device(config["device"] if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = torch.nn.CrossEntropyLoss()
 
     num_epochs = config["num_epochs"]
     eval_every = config["eval_every"]
@@ -96,25 +104,30 @@ def train(model, train_loader, val_loader, test_loader, optimizer, config):
     final_metrics = {}
 
     for epoch in range(num_epochs):
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+        epoch_start = time.perf_counter()
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            epoch,
+        )
+        epoch_time_ms = (time.perf_counter() - epoch_start) * 1_000
 
         trackio.log({"epoch": epoch + 1, "train_loss": train_loss, "train_acc": train_acc})
 
+        current_lr = get_learning_rate(optimizer)
+        lr_display = f"{current_lr:.6e}" if current_lr is not None else "n/a"
+        print(f"epoch {epoch:3} | {train_loss=:.4f} | {train_acc=:.2f}% | lr {lr_display} | {epoch_time_ms:0.2f}ms")
+
         if (epoch + 1) % eval_every == 0 or epoch == num_epochs - 1:
             val_loss, val_acc = validate(model, val_loader, criterion, device)
-
             trackio.log({"epoch": epoch + 1, "val_loss": val_loss, "val_acc": val_acc})
-
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}: "
-                f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
-                f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%"
-            )
+            print(f"eval | {val_loss=:.4f} | {val_acc=:.2f}%")
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-        else:
-            print(f"Epoch {epoch + 1}/{num_epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
 
     print("\nEvaluating on test set...")
     test_loss, test_acc = validate(model, test_loader, criterion, device)
