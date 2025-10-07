@@ -16,7 +16,7 @@ num_classes: 10
 # Training settings
 batch_size: 128
 num_epochs: 200
-eval_every: 10  # Evaluate every N epochs
+eval_every: 999999  # Evaluate every N epochs (set to large number to disable by default)
 
 # Optimizer settings (will override for each experiment)
 optimizer:

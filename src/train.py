@@ -1,6 +1,7 @@
 import time
 import trackio
 import torch
+import os
 
 
 def get_learning_rate(optimizer):
@@ -83,7 +84,7 @@ def validate(model, val_loader, criterion, device):
     return avg_loss, avg_acc
 
 
-def train(model, train_loader, val_loader, test_loader, optimizer, config):
+def train(model, train_loader, val_loader, test_loader, optimizer, config, checkpoint_dir):
     """
     Main training loop
 
@@ -125,6 +126,21 @@ def train(model, train_loader, val_loader, test_loader, optimizer, config):
             val_loss, val_acc = validate(model, val_loader, criterion, device)
             trackio.log({"epoch": epoch + 1, "val_loss": val_loss, "val_acc": val_acc})
             print(f"eval | {val_loss=:.4f} | {val_acc=:.2f}%")
+
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch + 1}.pt")
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                },
+                checkpoint_path,
+            )
+            print(f"Checkpoint saved: {checkpoint_path}")
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc

@@ -132,8 +132,11 @@ def main():
 
     results_dir = setup_logging(config)
 
+    checkpoint_dir = os.path.join(config["log_dir"], "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     print("Starting training...")
-    final_metrics = train(model, train_loader, val_loader, test_loader, optimizer, config)
+    final_metrics = train(model, train_loader, val_loader, test_loader, optimizer, config, checkpoint_dir)
 
     results_path = os.path.join(results_dir, experiment_name)
     save_final_model(model, results_path, final_metrics)
