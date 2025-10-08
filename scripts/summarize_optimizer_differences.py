@@ -231,15 +231,16 @@ def load_model_and_metrics(model_info, device="cpu"):
     return model, metrics
 
 
-def compute_effective_rank(matrix):
+def compute_effective_rank(matrix, normalize=False):
     """
     Compute effective rank via singular value entropy
-
+    
     Args:
         matrix: 2D tensor (weight matrix)
+        normalize: If True, normalize by maximum possible rank
 
     Returns:
-        Effective rank (float)
+        Effective rank (float), optionally normalized by max possible rank
     """
     if matrix.dim() != 2:
         raise ValueError(f"Expected 2D matrix, got {matrix.dim()}D")
@@ -250,7 +251,13 @@ def compute_effective_rank(matrix):
 
     entropy = -(s_norm * torch.log(s_norm + SVD_EPSILON)).sum()
 
-    return torch.exp(entropy).item()
+    effective_rank = torch.exp(entropy).item()
+    
+    if normalize:
+        max_possible_rank = min(matrix.shape[0], matrix.shape[1])
+        return effective_rank / max_possible_rank
+    
+    return effective_rank
 
 
 def analyze_model_weights(model):
@@ -258,7 +265,7 @@ def analyze_model_weights(model):
     Analyze weight matrices of the model
 
     Returns:
-        Dict with effective ranks and singular values for each layer
+        Dict with effective ranks (absolute and relative) and singular values for each layer
     """
     weight_analysis = {}
 
@@ -267,12 +274,20 @@ def analyze_model_weights(model):
             U, S, V = torch.svd(param.data)
             singular_values = S.detach().cpu().numpy()
 
-            s_norm = S / S.sum()
-            entropy = -(s_norm * torch.log(s_norm + SVD_EPSILON)).sum()
-            eff_rank = torch.exp(entropy).item()
+            # Compute absolute effective rank
+            eff_rank_abs = compute_effective_rank(param.data, normalize=False)
+            
+            # Compute relative effective rank (normalized by max possible rank)
+            eff_rank_rel = compute_effective_rank(param.data, normalize=True)
+            
+            # Compute max possible rank for reference
+            max_possible_rank = min(param.shape[0], param.shape[1])
 
             weight_analysis[name] = {
-                "effective_rank": eff_rank,
+                "effective_rank": eff_rank_abs,  # Keep original field for backward compatibility
+                "effective_rank_absolute": eff_rank_abs,
+                "effective_rank_relative": eff_rank_rel,
+                "max_possible_rank": max_possible_rank,
                 "singular_values": singular_values.tolist(),
                 "shape": list(param.shape),
                 "num_params": param.numel(),
@@ -486,7 +501,7 @@ def plot_singular_value_spectra(results, output_dir):
 
 def plot_effective_ranks(results, output_dir):
     """
-    Plot effective ranks by layer and optimizer
+    Plot effective ranks by layer and optimizer (both absolute and relative)
     """
 
     weight_analysis = results["weight_analysis"]
@@ -495,7 +510,14 @@ def plot_effective_ranks(results, output_dir):
     for exp_name, analysis in weight_analysis.items():
         optimizer = get_optimizer_name(exp_name)
         for layer_name, layer_data in analysis.items():
-            data.append({"optimizer": optimizer, "layer": layer_name, "effective_rank": layer_data["effective_rank"], "exp_name": exp_name})
+            data.append({
+                "optimizer": optimizer, 
+                "layer": layer_name, 
+                "effective_rank": layer_data["effective_rank"],  # Absolute (backward compatibility)
+                "effective_rank_relative": layer_data.get("effective_rank_relative", layer_data["effective_rank"]),  # Relative
+                "max_possible_rank": layer_data.get("max_possible_rank", min(layer_data["shape"])),
+                "exp_name": exp_name
+            })
 
     if not data:
         print("No data for effective rank plots")
@@ -503,15 +525,27 @@ def plot_effective_ranks(results, output_dir):
 
     df = pd.DataFrame(data)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    # Create 2x2 subplot for absolute and relative ranks
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 12))
 
+    # Absolute effective rank plots
     sns.boxplot(data=df, x="optimizer", y="effective_rank", ax=ax1)
-    ax1.set_title("Effective Rank Distribution by Optimizer")
-    ax1.set_ylabel("Effective Rank")
+    ax1.set_title("Absolute Effective Rank Distribution by Optimizer")
+    ax1.set_ylabel("Effective Rank (Absolute)")
 
-    pivot_df = df.groupby(["layer", "optimizer"])["effective_rank"].mean().unstack()
-    sns.heatmap(pivot_df, annot=True, fmt=".2f", cmap="viridis", ax=ax2)
-    ax2.set_title("Mean Effective Rank by Layer and Optimizer")
+    pivot_df_abs = df.groupby(["layer", "optimizer"])["effective_rank"].mean().unstack()
+    sns.heatmap(pivot_df_abs, annot=True, fmt=".2f", cmap="viridis", ax=ax2)
+    ax2.set_title("Mean Absolute Effective Rank by Layer and Optimizer")
+
+    # Relative effective rank plots (normalized)
+    sns.boxplot(data=df, x="optimizer", y="effective_rank_relative", ax=ax3)
+    ax3.set_title("Relative Effective Rank Distribution by Optimizer")
+    ax3.set_ylabel("Effective Rank (Normalized)")
+    ax3.set_ylim(0, 1)  # Relative ranks are between 0 and 1
+
+    pivot_df_rel = df.groupby(["layer", "optimizer"])["effective_rank_relative"].mean().unstack()
+    sns.heatmap(pivot_df_rel, annot=True, fmt=".3f", cmap="viridis", ax=ax4, vmin=0, vmax=1)
+    ax4.set_title("Mean Relative Effective Rank by Layer and Optimizer")
 
     plt.tight_layout()
     plt.savefig(output_dir / "effective_ranks.png", dpi=300, bbox_inches="tight")
@@ -619,12 +653,14 @@ def plot_scale_vs_optimizer_heatmap(results, output_dir):
     for exp_name, analysis in results["weight_analysis"].items():
         parsed = parse_experiment_name(exp_name)
         if parsed:
-            effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            effective_ranks_abs = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            effective_ranks_rel = [layer_data.get("effective_rank_relative", layer_data["effective_rank"]) for layer_data in analysis.values()]
             data.append({
                 "scale": parsed["scale"],
                 "optimizer": parsed["optimizer"],
                 "exp_name": exp_name,
-                "mean_effective_rank": np.mean(effective_ranks)
+                "mean_effective_rank_absolute": np.mean(effective_ranks_abs),
+                "mean_effective_rank_relative": np.mean(effective_ranks_rel)
             })
     
     # Add activation data
@@ -644,25 +680,33 @@ def plot_scale_vs_optimizer_heatmap(results, output_dir):
     
     df = pd.DataFrame(data)
     
-    # Create subplots for different metrics
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    # Create subplots for different metrics (now 3 panels)
+    fig, axes = plt.subplots(1, 3, figsize=(24, 6))
     
-    # Plot 1: Effective Rank Heatmap
-    rank_pivot = df.groupby(["scale", "optimizer"])["mean_effective_rank"].mean().unstack()
-    if not rank_pivot.empty:
-        sns.heatmap(rank_pivot, annot=True, fmt=".2f", cmap="viridis", ax=axes[0])
-        axes[0].set_title("Mean Effective Rank by Scale and Optimizer")
+    # Plot 1: Absolute Effective Rank Heatmap
+    rank_abs_pivot = df.groupby(["scale", "optimizer"])["mean_effective_rank_absolute"].mean().unstack()
+    if not rank_abs_pivot.empty:
+        sns.heatmap(rank_abs_pivot, annot=True, fmt=".2f", cmap="viridis", ax=axes[0])
+        axes[0].set_title("Mean Absolute Effective Rank by Scale and Optimizer")
         axes[0].set_xlabel("Optimizer")
         axes[0].set_ylabel("Model Scale")
     
-    # Plot 2: Sparsity Heatmap
+    # Plot 2: Relative Effective Rank Heatmap
+    rank_rel_pivot = df.groupby(["scale", "optimizer"])["mean_effective_rank_relative"].mean().unstack()
+    if not rank_rel_pivot.empty:
+        sns.heatmap(rank_rel_pivot, annot=True, fmt=".3f", cmap="viridis", ax=axes[1], vmin=0, vmax=1)
+        axes[1].set_title("Mean Relative Effective Rank by Scale and Optimizer")
+        axes[1].set_xlabel("Optimizer")
+        axes[1].set_ylabel("Model Scale")
+    
+    # Plot 3: Sparsity Heatmap
     if "mean_sparsity" in df.columns:
         sparsity_pivot = df.groupby(["scale", "optimizer"])["mean_sparsity"].mean().unstack()
         if not sparsity_pivot.empty:
-            sns.heatmap(sparsity_pivot, annot=True, fmt=".3f", cmap="plasma", ax=axes[1])
-            axes[1].set_title("Mean Activation Sparsity by Scale and Optimizer")
-            axes[1].set_xlabel("Optimizer")
-            axes[1].set_ylabel("Model Scale")
+            sns.heatmap(sparsity_pivot, annot=True, fmt=".3f", cmap="plasma", ax=axes[2])
+            axes[2].set_title("Mean Activation Sparsity by Scale and Optimizer")
+            axes[2].set_xlabel("Optimizer")
+            axes[2].set_ylabel("Model Scale")
     
     plt.tight_layout()
     plt.savefig(output_dir / "scale_optimizer_heatmaps.png", dpi=300, bbox_inches="tight")
@@ -693,9 +737,11 @@ def plot_scaling_trends(results, output_dir):
     for exp_name, analysis in results["weight_analysis"].items():
         parsed = parse_experiment_name(exp_name)
         if parsed and parsed["scale"] in scale_to_params:
-            effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            effective_ranks_abs = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            effective_ranks_rel = [layer_data.get("effective_rank_relative", layer_data["effective_rank"]) for layer_data in analysis.values()]
             by_optimizer[parsed["optimizer"]]["params"].append(scale_to_params[parsed["scale"]])
-            by_optimizer[parsed["optimizer"]]["effective_rank"].append(np.mean(effective_ranks))
+            by_optimizer[parsed["optimizer"]]["effective_rank_absolute"].append(np.mean(effective_ranks_abs))
+            by_optimizer[parsed["optimizer"]]["effective_rank_relative"].append(np.mean(effective_ranks_rel))
             by_optimizer[parsed["optimizer"]]["scale"].append(parsed["scale"])
     
     # Add activation data
@@ -714,16 +760,16 @@ def plot_scaling_trends(results, output_dir):
         print("No scaling data available")
         return
     
-    # Create plots
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    # Create plots (now 3 subplots)
+    fig, axes = plt.subplots(1, 3, figsize=(24, 6))
     
-    # Plot 1: Effective Rank vs Parameters
+    # Plot 1: Absolute Effective Rank vs Parameters
     ax1 = axes[0]
     for optimizer, data in by_optimizer.items():
-        if "effective_rank" in data and "params" in data:
+        if "effective_rank_absolute" in data and "params" in data:
             # Group by scale and average across seeds
             scale_data = defaultdict(list)
-            for scale, rank in zip(data["scale"], data["effective_rank"]):
+            for scale, rank in zip(data["scale"], data["effective_rank_absolute"]):
                 scale_data[scale].append(rank)
             
             scales = sorted(scale_data.keys(), key=lambda s: scale_to_params[s])
@@ -734,13 +780,36 @@ def plot_scaling_trends(results, output_dir):
     
     ax1.set_xscale("log")
     ax1.set_xlabel("Model Parameters (Millions)")
-    ax1.set_ylabel("Mean Effective Rank")
-    ax1.set_title("Effective Rank Scaling")
+    ax1.set_ylabel("Mean Absolute Effective Rank")
+    ax1.set_title("Absolute Effective Rank Scaling")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Sparsity vs Parameters
+    # Plot 2: Relative Effective Rank vs Parameters
     ax2 = axes[1]
+    for optimizer, data in by_optimizer.items():
+        if "effective_rank_relative" in data and "params" in data:
+            # Group by scale and average across seeds
+            scale_data = defaultdict(list)
+            for scale, rank in zip(data["scale"], data["effective_rank_relative"]):
+                scale_data[scale].append(rank)
+            
+            scales = sorted(scale_data.keys(), key=lambda s: scale_to_params[s])
+            params = [scale_to_params[s] / 1e6 for s in scales]
+            ranks = [np.mean(scale_data[s]) for s in scales]
+            
+            ax2.plot(params, ranks, 'o-', label=optimizer.upper(), linewidth=2, markersize=8)
+    
+    ax2.set_xscale("log")
+    ax2.set_xlabel("Model Parameters (Millions)")
+    ax2.set_ylabel("Mean Relative Effective Rank")
+    ax2.set_title("Relative Effective Rank Scaling")
+    ax2.set_ylim(0, 1)  # Relative ranks are normalized
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Sparsity vs Parameters
+    ax3 = axes[2]
     for optimizer, data in by_optimizer.items():
         if "sparsity" in data and "params" in data and len(data["sparsity"]) == len(data["scale"]):
             # Group by scale and average across seeds
@@ -752,14 +821,14 @@ def plot_scaling_trends(results, output_dir):
             params = [scale_to_params[s] / 1e6 for s in scales]
             sparsities = [np.mean(scale_data[s]) for s in scales]
             
-            ax2.plot(params, sparsities, 'o-', label=optimizer.upper(), linewidth=2, markersize=8)
+            ax3.plot(params, sparsities, 'o-', label=optimizer.upper(), linewidth=2, markersize=8)
     
-    ax2.set_xscale("log")
-    ax2.set_xlabel("Model Parameters (Millions)")
-    ax2.set_ylabel("Mean Activation Sparsity")
-    ax2.set_title("Sparsity Scaling")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    ax3.set_xscale("log")
+    ax3.set_xlabel("Model Parameters (Millions)")
+    ax3.set_ylabel("Mean Activation Sparsity")
+    ax3.set_title("Sparsity Scaling")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(output_dir / "scaling_trends.png", dpi=300, bbox_inches="tight")
@@ -784,16 +853,21 @@ def create_summary_table(results, output_dir):
             if parsed["has_scale"] and SCALE_SUPPORT:
                 has_scale_data = True
             
-            effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            effective_ranks_abs = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            effective_ranks_rel = [layer_data.get("effective_rank_relative", layer_data["effective_rank"]) for layer_data in analysis.values()]
             
             # Original grouping (backward compatibility)
-            summary[optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks))
-            summary[optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks))
+            summary[optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks_abs))
+            summary[optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks_abs))
+            summary[optimizer]["weight_effective_rank_relative_mean"].append(np.mean(effective_ranks_rel))
+            summary[optimizer]["weight_effective_rank_relative_std"].append(np.std(effective_ranks_rel))
             
             # Scale-aware grouping
             if SCALE_SUPPORT:
-                scale_aware_summary[scale][optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks))
-                scale_aware_summary[scale][optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks))
+                scale_aware_summary[scale][optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks_abs))
+                scale_aware_summary[scale][optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks_abs))
+                scale_aware_summary[scale][optimizer]["weight_effective_rank_relative_mean"].append(np.mean(effective_ranks_rel))
+                scale_aware_summary[scale][optimizer]["weight_effective_rank_relative_std"].append(np.std(effective_ranks_rel))
 
     for exp_name, analysis in results["activation_analysis"].items():
         parsed = parse_experiment_name(exp_name)
@@ -855,7 +929,11 @@ def create_summary_table(results, output_dir):
 
         if "weight_effective_rank_mean_across_seeds" in metrics:
             eff_rank = metrics["weight_effective_rank_mean_across_seeds"]
-            print(f"  Weight Effective Rank: {eff_rank['mean']:.3f} ± {eff_rank['std']:.3f}")
+            print(f"  Weight Effective Rank (Absolute): {eff_rank['mean']:.3f} ± {eff_rank['std']:.3f}")
+
+        if "weight_effective_rank_relative_mean_across_seeds" in metrics:
+            eff_rank_rel = metrics["weight_effective_rank_relative_mean_across_seeds"]
+            print(f"  Weight Effective Rank (Relative): {eff_rank_rel['mean']:.3f} ± {eff_rank_rel['std']:.3f}")
 
         if "activation_sparsity_mean_across_seeds" in metrics:
             sparsity = metrics["activation_sparsity_mean_across_seeds"]
@@ -879,7 +957,11 @@ def create_summary_table(results, output_dir):
                 
                 if "weight_effective_rank_mean_across_seeds" in metrics:
                     eff_rank = metrics["weight_effective_rank_mean_across_seeds"]
-                    print(f"    Effective Rank: {eff_rank['mean']:.3f} ± {eff_rank['std']:.3f}")
+                    print(f"    Effective Rank (Absolute): {eff_rank['mean']:.3f} ± {eff_rank['std']:.3f}")
+                
+                if "weight_effective_rank_relative_mean_across_seeds" in metrics:
+                    eff_rank_rel = metrics["weight_effective_rank_relative_mean_across_seeds"]
+                    print(f"    Effective Rank (Relative): {eff_rank_rel['mean']:.3f} ± {eff_rank_rel['std']:.3f}")
                 
                 if "activation_sparsity_mean_across_seeds" in metrics:
                     sparsity = metrics["activation_sparsity_mean_across_seeds"]
