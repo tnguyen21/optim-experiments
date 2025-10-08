@@ -192,6 +192,7 @@ wandb/
 mlruns/
 .neptune/
 analysis/
+checkpoint_analysis/
 temp/
 
 # Temporary files
