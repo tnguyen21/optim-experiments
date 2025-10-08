@@ -1,0 +1,32 @@
+# AdamW Optimal Configuration for ViT-Small
+# Learning rate scaled for smaller batch size due to memory constraints
+# ~10M parameters
+experiment_name: "vit_small_cifar10_adamw_optimal"
+seed: 42
+device: "cuda"  # or "cpu"
+
+# Data settings
+dataset: "cifar10"
+data_dir: "./data"
+num_workers: 8
+train_val_split: 0.9  # 90% train, 10% val from training set
+
+# Model settings
+model: "vit_small"
+model_scale: "small"  # ~10M parameters
+num_classes: 10
+
+# Training settings
+batch_size: 2048  # Reduced for memory efficiency with larger model
+num_epochs: 150
+eval_every: 10  # Evaluate every N epochs
+
+# AdamW Optimizer settings (LR scaled down for smaller batch size)
+optimizer:
+  type: "adamw"
+  lr: 0.0005  # 0.001 * (2048/4096) = 0.0005 (linear scaling rule)
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# Logging
+log_dir: "./experiments/logs"

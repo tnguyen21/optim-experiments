@@ -20,7 +20,7 @@ num_classes: 10
 
 # Training settings
 batch_size: 4096  # Learning rates below optimized for this batch size
-num_epochs: 150
+num_epochs: 3
 eval_every: 10  # Evaluate every N epochs
 
 # Optimizer settings

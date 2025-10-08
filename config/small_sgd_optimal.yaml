@@ -1,0 +1,32 @@
+# SGD Optimal Configuration for ViT-Small
+# Learning rate scaled for smaller batch size due to memory constraints
+# ~10M parameters
+experiment_name: "vit_small_cifar10_sgd_optimal"
+seed: 42
+device: "cuda"  # or "cpu"
+
+# Data settings
+dataset: "cifar10"
+data_dir: "./data"
+num_workers: 8
+train_val_split: 0.9  # 90% train, 10% val from training set
+
+# Model settings
+model: "vit_small"
+model_scale: "small"  # ~10M parameters
+num_classes: 10
+
+# Training settings
+batch_size: 2048  # Reduced for memory efficiency with larger model
+num_epochs: 150
+eval_every: 10  # Evaluate every N epochs
+
+# SGD Optimizer settings (LR scaled down for smaller batch size)
+optimizer:
+  type: "sgd"
+  lr: 0.05  # 0.1 * (2048/4096) = 0.05 (linear scaling rule)
+  momentum: 0.9
+  weight_decay: 0.0001
+
+# Logging
+log_dir: "./experiments/logs"

@@ -1,4 +1,4 @@
-# AdamW Optimal Configuration
+# AdamW Optimal Configuration for ViT-Tiny
 # Learning rate optimized for batch size 4096 based on LR sweep results
 # Best validation accuracy: 71.49%
 experiment_name: "vit_tiny_cifar10_adamw_optimal"
@@ -13,7 +13,7 @@ train_val_split: 0.9  # 90% train, 10% val from training set
 
 # Model settings
 model: "vit_tiny"
-model_scale: "tiny"  # ~5M parameters (for backward compatibility)
+model_scale: "tiny"  # ~5M parameters
 num_classes: 10
 
 # Training settings

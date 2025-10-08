@@ -13,6 +13,7 @@ train_val_split: 0.9  # 90% train, 10% val from training set
 
 # Model settings
 model: "vit_tiny"
+model_scale: "tiny"  # ~5M parameters (for backward compatibility)
 num_classes: 10
 
 # Training settings
