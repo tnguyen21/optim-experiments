@@ -14,6 +14,7 @@ python scripts/analyze_models.py
 import os
 import sys
 import json
+import argparse
 from pathlib import Path
 import torch
 import torch.nn.functional as F
@@ -28,6 +29,14 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "src"))
 from models import ViTTiny
 from data import get_cifar10_dataloaders
 
+# Import model scale functionality
+try:
+    from model_scale_sweep import ViTScaled, design_model_scales
+    SCALE_SUPPORT = True
+except ImportError:
+    SCALE_SUPPORT = False
+    print("Note: Model scale analysis not available (model_scale_sweep.py not found)")
+
 
 MEMORY_LIMIT = 10000  # For activation covariance computation
 DEFAULT_NUM_BATCHES = 5  # Default number of batches for activation collection
@@ -35,17 +44,79 @@ SPARSITY_THRESHOLD = 0.01  # Threshold for sparsity computation
 SVD_EPSILON = 1e-10  # Small epsilon to avoid log(0) in entropy computation
 
 
+def parse_experiment_name(exp_name):
+    """
+    Parse experiment name to extract scale, optimizer, lr, seed
+    
+    Supports both formats:
+    - Original: optimizer_lr{value}_seed{value}_{timestamp}
+    - Scale-aware: {scale}_{optimizer}_lr{value}_seed{value}_{timestamp}
+    
+    Returns:
+        Dict with parsed components
+    """
+    parts = exp_name.split("_")
+    
+    # Try scale-aware format first
+    if len(parts) >= 5 and SCALE_SUPPORT:
+        try:
+            scale = parts[0]
+            optimizer = parts[1]
+            lr_str = parts[2]
+            seed_str = parts[3]
+            
+            # Validate it's actually a scale name
+            model_configs = design_model_scales()
+            if scale.lower() in model_configs:
+                lr = float(lr_str.replace("lr", ""))
+                seed = int(seed_str.replace("seed", ""))
+                return {
+                    "scale": scale.lower(),
+                    "optimizer": optimizer,
+                    "lr": lr,
+                    "seed": seed,
+                    "has_scale": True
+                }
+        except (ValueError, IndexError):
+            pass
+    
+    # Fall back to original format
+    if len(parts) >= 4:
+        try:
+            optimizer = parts[0]
+            lr_str = parts[1]
+            seed_str = parts[2]
+            
+            lr = float(lr_str.replace("lr", ""))
+            seed = int(seed_str.replace("seed", ""))
+            return {
+                "scale": "tiny",  # Default for original format
+                "optimizer": optimizer,
+                "lr": lr,
+                "seed": seed,
+                "has_scale": False
+            }
+        except (ValueError, IndexError):
+            pass
+    
+    # Couldn't parse
+    return None
+
+
 def get_optimizer_name(exp_name):
-    """Extract optimizer name from experiment name"""
-    return exp_name.split("_")[0]
+    """Extract optimizer name from experiment name (backward compatibility)"""
+    parsed = parse_experiment_name(exp_name)
+    return parsed["optimizer"] if parsed else exp_name.split("_")[0]
 
 
 def discover_trained_models(results_dir="experiments/results"):
     """
     Discover all trained models in the results directory
+    
+    Now supports both original and scale-aware experiment formats.
 
     Returns:
-        List of dicts with model info: [{optimizer, lr, seed, model_path, metrics_path}, ...]
+        List of dicts with model info: [{scale, optimizer, lr, seed, model_path, metrics_path, has_scale}, ...]
     """
     models = []
     results_path = Path(results_dir)
@@ -68,43 +139,77 @@ def discover_trained_models(results_dir="experiments/results"):
 
         if model_path.exists() and metrics_path.exists():
             exp_name = exp_dir.name
-            parts = exp_name.split("_")
+            
+            # Parse experiment name
+            parsed = parse_experiment_name(exp_name)
+            if parsed:
+                models.append({
+                    "scale": parsed["scale"],
+                    "optimizer": parsed["optimizer"],
+                    "lr": parsed["lr"],
+                    "seed": parsed["seed"],
+                    "has_scale": parsed["has_scale"],
+                    "exp_name": exp_name,
+                    "model_path": str(model_path),
+                    "metrics_path": str(metrics_path),
+                })
+            else:
+                print(f"Could not parse experiment name: {exp_name}")
 
-            if len(parts) >= 4:  # Expected format: optimizer_lr{value}_seed{value}_{timestamp}
-                optimizer = parts[0]
-                lr_str = parts[1]  # lr{value}
-                seed_str = parts[2]  # seed{value}
-
-                try:
-                    lr = float(lr_str.replace("lr", ""))
-                    seed = int(seed_str.replace("seed", ""))
-
-                    models.append(
-                        {
-                            "optimizer": optimizer,
-                            "lr": lr,
-                            "seed": seed,
-                            "exp_name": exp_name,
-                            "model_path": str(model_path),
-                            "metrics_path": str(metrics_path),
-                        }
-                    )
-                except ValueError:
-                    print(f"Could not parse experiment name: {exp_name}")
-
-    print(f"Found {len(models)} trained models")
+    # Group and summarize discoveries
+    by_scale = defaultdict(lambda: defaultdict(list))
     for model in models:
-        print(f"  {model['optimizer']} (lr={model['lr']}, seed={model['seed']})")
+        by_scale[model["scale"]][model["optimizer"]].append(model)
+    
+    print(f"Found {len(models)} trained models:")
+    for scale, optimizers in by_scale.items():
+        total_for_scale = sum(len(models) for models in optimizers.values())
+        print(f"  {scale.upper()}: {total_for_scale} models")
+        for optimizer, models_list in optimizers.items():
+            seeds = [m["seed"] for m in models_list]
+            print(f"    {optimizer}: {len(models_list)} models (seeds: {seeds})")
 
     return models
+
+
+def create_model_by_scale(scale):
+    """
+    Create model instance based on scale name
+    
+    Args:
+        scale: Scale name (tiny, small, medium, large, xl)
+        
+    Returns:
+        Model instance
+    """
+    if scale == "tiny" or not SCALE_SUPPORT:
+        # Use original ViTTiny for backward compatibility
+        return ViTTiny(num_classes=10)
+    
+    # Use scaled model
+    model_configs = design_model_scales()
+    if scale not in model_configs:
+        print(f"Warning: Unknown scale '{scale}', falling back to tiny")
+        return ViTTiny(num_classes=10)
+    
+    config = model_configs[scale]
+    return ViTScaled(
+        embed_dim=config["embed_dim"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=10
+    )
 
 
 def load_model_and_metrics(model_info, device="cpu"):
     """
     Load a trained model and its metrics
+    
+    Now supports dynamic model creation based on scale.
 
     Args:
-        model_info: Dict with model_path and metrics_path
+        model_info: Dict with model_path, metrics_path, and scale
         device: Device to load model on
 
     Returns:
@@ -113,7 +218,11 @@ def load_model_and_metrics(model_info, device="cpu"):
     with open(model_info["metrics_path"], "r") as f:
         metrics = json.load(f)
 
-    model = ViTTiny(num_classes=10)
+    # Create model based on scale
+    scale = model_info.get("scale", "tiny")
+    model = create_model_by_scale(scale)
+    
+    # Load weights
     state_dict = torch.load(model_info["model_path"], map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)
@@ -496,43 +605,249 @@ def plot_class_similarity_heatmaps(results, output_dir):
     plt.close()
 
 
+def plot_scale_vs_optimizer_heatmap(results, output_dir):
+    """
+    Create heatmaps showing metrics across (scale, optimizer) combinations
+    """
+    if not SCALE_SUPPORT:
+        return
+    
+    plt.style.use("seaborn-v0_8")
+    
+    # Extract data with scale information
+    data = []
+    for exp_name, analysis in results["weight_analysis"].items():
+        parsed = parse_experiment_name(exp_name)
+        if parsed:
+            effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            data.append({
+                "scale": parsed["scale"],
+                "optimizer": parsed["optimizer"],
+                "exp_name": exp_name,
+                "mean_effective_rank": np.mean(effective_ranks)
+            })
+    
+    # Add activation data
+    for exp_name, analysis in results["activation_analysis"].items():
+        parsed = parse_experiment_name(exp_name)
+        if parsed:
+            sparsities = [stats["sparsity"] for stats in analysis.values()]
+            # Find corresponding entry
+            for entry in data:
+                if entry["exp_name"] == exp_name:
+                    entry["mean_sparsity"] = np.mean(sparsities)
+                    break
+    
+    if not data:
+        print("No scale data available for heatmap")
+        return
+    
+    df = pd.DataFrame(data)
+    
+    # Create subplots for different metrics
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Plot 1: Effective Rank Heatmap
+    rank_pivot = df.groupby(["scale", "optimizer"])["mean_effective_rank"].mean().unstack()
+    if not rank_pivot.empty:
+        sns.heatmap(rank_pivot, annot=True, fmt=".2f", cmap="viridis", ax=axes[0])
+        axes[0].set_title("Mean Effective Rank by Scale and Optimizer")
+        axes[0].set_xlabel("Optimizer")
+        axes[0].set_ylabel("Model Scale")
+    
+    # Plot 2: Sparsity Heatmap
+    if "mean_sparsity" in df.columns:
+        sparsity_pivot = df.groupby(["scale", "optimizer"])["mean_sparsity"].mean().unstack()
+        if not sparsity_pivot.empty:
+            sns.heatmap(sparsity_pivot, annot=True, fmt=".3f", cmap="plasma", ax=axes[1])
+            axes[1].set_title("Mean Activation Sparsity by Scale and Optimizer")
+            axes[1].set_xlabel("Optimizer")
+            axes[1].set_ylabel("Model Scale")
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "scale_optimizer_heatmaps.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def plot_scaling_trends(results, output_dir):
+    """
+    Create line plots showing how metrics scale with model size
+    """
+    if not SCALE_SUPPORT:
+        return
+    
+    plt.style.use("seaborn-v0_8")
+    sns.set_palette("Set2")
+    
+    # Get model parameter counts
+    model_configs = design_model_scales()
+    scale_to_params = {}
+    for scale, config in model_configs.items():
+        model = create_model_by_scale(scale)
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        scale_to_params[scale] = total_params
+    
+    # Extract and organize data
+    by_optimizer = defaultdict(lambda: defaultdict(list))
+    
+    for exp_name, analysis in results["weight_analysis"].items():
+        parsed = parse_experiment_name(exp_name)
+        if parsed and parsed["scale"] in scale_to_params:
+            effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            by_optimizer[parsed["optimizer"]]["params"].append(scale_to_params[parsed["scale"]])
+            by_optimizer[parsed["optimizer"]]["effective_rank"].append(np.mean(effective_ranks))
+            by_optimizer[parsed["optimizer"]]["scale"].append(parsed["scale"])
+    
+    # Add activation data
+    for exp_name, analysis in results["activation_analysis"].items():
+        parsed = parse_experiment_name(exp_name)
+        if parsed and parsed["scale"] in scale_to_params:
+            sparsities = [stats["sparsity"] for stats in analysis.values()]
+            # Find index for this experiment
+            try:
+                idx = len(by_optimizer[parsed["optimizer"]]["sparsity"])
+                by_optimizer[parsed["optimizer"]]["sparsity"].append(np.mean(sparsities))
+            except:
+                pass
+    
+    if not by_optimizer:
+        print("No scaling data available")
+        return
+    
+    # Create plots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Plot 1: Effective Rank vs Parameters
+    ax1 = axes[0]
+    for optimizer, data in by_optimizer.items():
+        if "effective_rank" in data and "params" in data:
+            # Group by scale and average across seeds
+            scale_data = defaultdict(list)
+            for scale, rank in zip(data["scale"], data["effective_rank"]):
+                scale_data[scale].append(rank)
+            
+            scales = sorted(scale_data.keys(), key=lambda s: scale_to_params[s])
+            params = [scale_to_params[s] / 1e6 for s in scales]  # Convert to millions
+            ranks = [np.mean(scale_data[s]) for s in scales]
+            
+            ax1.plot(params, ranks, 'o-', label=optimizer.upper(), linewidth=2, markersize=8)
+    
+    ax1.set_xscale("log")
+    ax1.set_xlabel("Model Parameters (Millions)")
+    ax1.set_ylabel("Mean Effective Rank")
+    ax1.set_title("Effective Rank Scaling")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Sparsity vs Parameters
+    ax2 = axes[1]
+    for optimizer, data in by_optimizer.items():
+        if "sparsity" in data and "params" in data and len(data["sparsity"]) == len(data["scale"]):
+            # Group by scale and average across seeds
+            scale_data = defaultdict(list)
+            for scale, sparsity in zip(data["scale"], data["sparsity"]):
+                scale_data[scale].append(sparsity)
+            
+            scales = sorted(scale_data.keys(), key=lambda s: scale_to_params[s])
+            params = [scale_to_params[s] / 1e6 for s in scales]
+            sparsities = [np.mean(scale_data[s]) for s in scales]
+            
+            ax2.plot(params, sparsities, 'o-', label=optimizer.upper(), linewidth=2, markersize=8)
+    
+    ax2.set_xscale("log")
+    ax2.set_xlabel("Model Parameters (Millions)")
+    ax2.set_ylabel("Mean Activation Sparsity")
+    ax2.set_title("Sparsity Scaling")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "scaling_trends.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+
 def create_summary_table(results, output_dir):
     """
-    Create a summary comparison table
+    Create a summary comparison table with scale awareness
     """
 
+    # Organize data by (scale, optimizer) when possible, fallback to optimizer only
     summary = defaultdict(lambda: defaultdict(list))
+    scale_aware_summary = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    has_scale_data = False
 
     for exp_name, analysis in results["weight_analysis"].items():
-        optimizer = get_optimizer_name(exp_name)
-
-        effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
-        summary[optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks))
-        summary[optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks))
+        parsed = parse_experiment_name(exp_name)
+        if parsed:
+            optimizer = parsed["optimizer"]
+            scale = parsed["scale"]
+            if parsed["has_scale"] and SCALE_SUPPORT:
+                has_scale_data = True
+            
+            effective_ranks = [layer_data["effective_rank"] for layer_data in analysis.values()]
+            
+            # Original grouping (backward compatibility)
+            summary[optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks))
+            summary[optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks))
+            
+            # Scale-aware grouping
+            if SCALE_SUPPORT:
+                scale_aware_summary[scale][optimizer]["weight_effective_rank_mean"].append(np.mean(effective_ranks))
+                scale_aware_summary[scale][optimizer]["weight_effective_rank_std"].append(np.std(effective_ranks))
 
     for exp_name, analysis in results["activation_analysis"].items():
-        optimizer = get_optimizer_name(exp_name)
+        parsed = parse_experiment_name(exp_name)
+        if parsed:
+            optimizer = parsed["optimizer"]
+            scale = parsed["scale"]
 
-        magnitudes = [stats["mean_magnitude"] for stats in analysis.values()]
-        sparsities = [stats["sparsity"] for stats in analysis.values()]
-        variances = [stats["variance"] for stats in analysis.values()]
+            magnitudes = [stats["mean_magnitude"] for stats in analysis.values()]
+            sparsities = [stats["sparsity"] for stats in analysis.values()]
+            variances = [stats["variance"] for stats in analysis.values()]
 
-        summary[optimizer]["activation_magnitude_mean"].append(np.mean(magnitudes))
-        summary[optimizer]["activation_sparsity_mean"].append(np.mean(sparsities))
-        summary[optimizer]["activation_variance_mean"].append(np.mean(variances))
+            # Original grouping
+            summary[optimizer]["activation_magnitude_mean"].append(np.mean(magnitudes))
+            summary[optimizer]["activation_sparsity_mean"].append(np.mean(sparsities))
+            summary[optimizer]["activation_variance_mean"].append(np.mean(variances))
+            
+            # Scale-aware grouping
+            if SCALE_SUPPORT:
+                scale_aware_summary[scale][optimizer]["activation_magnitude_mean"].append(np.mean(magnitudes))
+                scale_aware_summary[scale][optimizer]["activation_sparsity_mean"].append(np.mean(sparsities))
+                scale_aware_summary[scale][optimizer]["activation_variance_mean"].append(np.mean(variances))
 
+    # Create final summaries
     final_summary = {}
     for optimizer, metrics in summary.items():
         final_summary[optimizer] = {}
         for metric, values in metrics.items():
             final_summary[optimizer][f"{metric}_across_seeds"] = {"mean": float(np.mean(values)), "std": float(np.std(values))}
 
+    # Scale-aware final summary
+    scale_summary = {}
+    if SCALE_SUPPORT:
+        for scale, optimizers in scale_aware_summary.items():
+            scale_summary[scale] = {}
+            for optimizer, metrics in optimizers.items():
+                scale_summary[scale][optimizer] = {}
+                for metric, values in metrics.items():
+                    scale_summary[scale][optimizer][f"{metric}_across_seeds"] = {
+                        "mean": float(np.mean(values)), 
+                        "std": float(np.std(values))
+                    }
+
+    # Save summaries
     with open(output_dir / "summary_table.json", "w") as f:
         json.dump(final_summary, f, indent=2)
+    
+    if scale_summary:
+        with open(output_dir / "scale_summary_table.json", "w") as f:
+            json.dump(scale_summary, f, indent=2)
 
-    print("\n" + "=" * 60)
-    print("SUMMARY COMPARISON")
-    print("=" * 60)
+    # Print results
+    print("\n" + "=" * 80)
+    print("OPTIMIZER COMPARISON SUMMARY")
+    print("=" * 80)
 
     for optimizer in sorted(final_summary.keys()):
         print(f"\n{optimizer.upper()}:")
@@ -550,18 +865,89 @@ def create_summary_table(results, output_dir):
             variance = metrics["activation_variance_mean_across_seeds"]
             print(f"  Activation Variance: {variance['mean']:.6f} ± {variance['std']:.6f}")
 
+    # Print scale-aware summary
+    if scale_summary and has_scale_data:
+        print("\n" + "=" * 80)
+        print("SCALE-AWARE ANALYSIS SUMMARY")
+        print("=" * 80)
+        
+        for scale in sorted(scale_summary.keys()):
+            print(f"\n{scale.upper()} MODELS:")
+            for optimizer in sorted(scale_summary[scale].keys()):
+                print(f"  {optimizer.upper()}:")
+                metrics = scale_summary[scale][optimizer]
+                
+                if "weight_effective_rank_mean_across_seeds" in metrics:
+                    eff_rank = metrics["weight_effective_rank_mean_across_seeds"]
+                    print(f"    Effective Rank: {eff_rank['mean']:.3f} ± {eff_rank['std']:.3f}")
+                
+                if "activation_sparsity_mean_across_seeds" in metrics:
+                    sparsity = metrics["activation_sparsity_mean_across_seeds"]
+                    print(f"    Sparsity: {sparsity['mean']:.3f} ± {sparsity['std']:.3f}")
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Analyze trained models to compare optimizers and model scales",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Analyze models in default experiments/results directory
+  python scripts/summarize_optimizer_differences.py
+  
+  # Analyze models from model scale sweep
+  python scripts/summarize_optimizer_differences.py --experiments model_scale_sweep_20251008_123456
+  
+  # Analyze models with custom output directory
+  python scripts/summarize_optimizer_differences.py --experiments experiments/results --output custom_analysis
+        """
+    )
+    
+    parser.add_argument(
+        "--experiments", 
+        type=str, 
+        default="experiments/results",
+        help="Directory containing trained model results (default: experiments/results)"
+    )
+    
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="analysis",
+        help="Output directory for analysis results (default: analysis)"
+    )
+    
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device to use for analysis (default: auto)"
+    )
+    
+    return parser.parse_args()
+
 
 def main():
     """Main analysis function"""
+    args = parse_args()
+    
     print("Starting model analysis...")
+    print(f"Experiments directory: {args.experiments}")
+    print(f"Output directory: {args.output}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Setup device
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    output_dir = Path("analysis")
+    output_dir = Path(args.output)
     output_dir.mkdir(exist_ok=True)
 
-    models = discover_trained_models()
+    models = discover_trained_models(args.experiments)
     if not models:
         print("No trained models found!")
         return
@@ -614,11 +1000,21 @@ def main():
 
     print("\nGenerating visualizations...")
     try:
+        # Original visualizations
         plot_singular_value_spectra(all_results, output_dir)
         plot_effective_ranks(all_results, output_dir)
         plot_activation_statistics(all_results, output_dir)
         plot_class_similarity_heatmaps(all_results, output_dir)
+        
+        # New scale-aware visualizations
+        if SCALE_SUPPORT:
+            print("  Generating scale analysis plots...")
+            plot_scale_vs_optimizer_heatmap(all_results, output_dir)
+            plot_scaling_trends(all_results, output_dir)
+        
+        # Summary tables (both original and scale-aware)
         create_summary_table(all_results, output_dir)
+        
         print("✓ Visualizations complete!")
     except Exception as e:
         print(f"Warning: Could not generate some visualizations: {e}")

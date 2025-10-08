@@ -21,16 +21,32 @@ from data import get_cifar10_dataloaders
 from train import train
 from utils import set_seed, get_optimizer, setup_logging, save_final_model
 
+# Import scale functionality with graceful fallback
+try:
+    sys.path.append(os.path.dirname(__file__))
+    from model_scale_sweep import ViTScaled, design_model_scales, create_model_by_scale
+    SCALE_SUPPORT = True
+except ImportError:
+    SCALE_SUPPORT = False
+
 
 def parse_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Run ResNet-8 CIFAR-10 experiment")
+    parser = argparse.ArgumentParser(description="Run ViT CIFAR-10 experiment with optional model scaling")
 
     parser.add_argument("--config", type=str, default="config/base_config.yaml", help="Path to config file")
     parser.add_argument("--optimizer", type=str, choices=["sgd", "adamw", "muon"], help="Optimizer type (overrides config)")
     parser.add_argument("--lr", type=float, help="Learning rate (overrides config)")
     parser.add_argument("--seed", type=int, help="Random seed (overrides config)")
     parser.add_argument("--experiment-name", type=str, help="Experiment name (overrides config)")
+    
+    # Add scale support
+    if SCALE_SUPPORT:
+        scale_choices = list(design_model_scales().keys())
+        parser.add_argument("--scale", type=str, choices=scale_choices, 
+                          help="Model scale (tiny/small/medium/large/xl). Auto-detected from config if not specified.")
+    else:
+        parser.add_argument("--scale", type=str, help="Model scale (scale support not available)")
 
     return parser.parse_args()
 
@@ -40,6 +56,43 @@ def load_config(config_path):
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     return config
+
+
+def detect_scale_from_config(config_path, config):
+    """
+    Auto-detect model scale from config file name or content
+    
+    Returns:
+        Scale name (str) or None if not detected
+    """
+    if not SCALE_SUPPORT:
+        return "tiny"
+    
+    # Try to detect from filename
+    config_filename = os.path.basename(config_path).lower()
+    scale_keywords = {
+        "tiny": ["tiny"],
+        "small": ["small"], 
+        "medium": ["medium"],
+        "large": ["large"],
+        "xl": ["xl"]
+    }
+    
+    for scale, keywords in scale_keywords.items():
+        if any(keyword in config_filename for keyword in keywords):
+            return scale
+    
+    # Try to detect from config content
+    if "model_scale" in config:
+        return config["model_scale"]
+    
+    # Check if specific scale configs are used
+    if "optimal" in config_filename:
+        # These are our optimizer-specific configs, default to tiny
+        return "tiny"
+    
+    # Default fallback
+    return "tiny"
 
 
 def override_config(config, args):
@@ -88,24 +141,40 @@ def override_config(config, args):
 
     if args.experiment_name:
         config["experiment_name"] = args.experiment_name
+    
+    # Handle scale override
+    if hasattr(args, 'scale') and args.scale:
+        config["model_scale"] = args.scale
 
     return config
 
 
 def create_experiment_name(config):
-    """Create a unique experiment name with timestamp"""
+    """Create a unique experiment name with timestamp and optional scale prefix"""
     optimizer = config["optimizer"]["type"]
     seed = config["seed"]
     lr = config["optimizer"]["lr"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    return f"{optimizer}_lr{lr}_seed{seed}_{timestamp}"
+    
+    # Include scale if specified and not tiny (for backward compatibility)
+    scale = config.get("model_scale", "tiny")
+    if scale != "tiny" and SCALE_SUPPORT:
+        return f"{scale}_{optimizer}_lr{lr}_seed{seed}_{timestamp}"
+    else:
+        return f"{optimizer}_lr{lr}_seed{seed}_{timestamp}"
 
 
 def main():
     args = parse_args()
 
     config = load_config(args.config)
+    
+    # Detect scale if not specified via CLI
+    if not (hasattr(args, 'scale') and args.scale):
+        detected_scale = detect_scale_from_config(args.config, config)
+        config["model_scale"] = detected_scale
+        print(f"Auto-detected model scale: {detected_scale}")
+    
     config = override_config(config, args)
 
     experiment_name = create_experiment_name(config)
@@ -120,12 +189,19 @@ def main():
     print("Loading CIFAR-10 dataset...")
     train_loader, val_loader, test_loader = get_cifar10_dataloaders(config)
 
-    print("Creating ViT-Tiny model...")
-    model = ViTTiny(num_classes=config["num_classes"])
+    # Create model based on scale
+    scale = config.get("model_scale", "tiny")
+    if SCALE_SUPPORT and scale != "tiny":
+        print(f"Creating ViT-{scale.upper()} model...")
+        model = create_model_by_scale(scale)
+    else:
+        print("Creating ViT-Tiny model...")
+        model = ViTTiny(num_classes=config["num_classes"])
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+    print(f"Model parameters: {total_params:,} total ({total_params/1e6:.1f}M), {trainable_params:,} trainable")
+    print(f"Model scale: {scale}")
 
     optimizer = get_optimizer(model, config)
     print(f"Using optimizer: {optimizer}")

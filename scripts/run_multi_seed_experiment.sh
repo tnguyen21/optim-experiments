@@ -1,30 +1,41 @@
 #!/bin/bash
 
-# Multi-seed experiment script for comparing optimizers
+# Multi-seed experiment script with optimized configurations
+# Uses optimizer-specific configs with optimal learning rates from LR sweep
 # Usage: ./scripts/run_multi_seed_experiment.sh
 
 set -e  # Exit on any error
 
 # Configuration
 SEEDS=(42 123 456 314 2718)
+
+# Optimizer-specific configurations with optimal LRs
+declare -A OPTIMIZER_CONFIGS
+OPTIMIZER_CONFIGS["sgd"]="config/sgd_optimal_config.yaml"
+OPTIMIZER_CONFIGS["adamw"]="config/adamw_optimal_config.yaml"
+OPTIMIZER_CONFIGS["muon"]="config/muon_optimal_config.yaml"
+
 OPTIMIZERS=("sgd" "adamw" "muon")
-CONFIG_FILE="config/base_config.yaml"
 
 echo "Starting multi-seed optimizer comparison experiment..."
+echo "Using optimizer-specific configs with optimal learning rates:"
+for opt in "${OPTIMIZERS[@]}"; do
+    echo "  $opt: ${OPTIMIZER_CONFIGS[$opt]}"
+done
 echo "Seeds: ${SEEDS[@]}"
-echo "Optimizers: ${OPTIMIZERS[@]}"
-echo "Config: $CONFIG_FILE"
 echo
 
 # Function to run a single experiment
 run_experiment() {
     local optimizer=$1
     local seed=$2
+    local config_file=${OPTIMIZER_CONFIGS[$optimizer]}
     
     echo "Running experiment: optimizer=$optimizer, seed=$seed"
+    echo "Config: $config_file"
+    
     python scripts/run_experiment.py \
-        --config $CONFIG_FILE \
-        --optimizer $optimizer \
+        --config $config_file \
         --seed $seed
     
     echo "Completed: optimizer=$optimizer, seed=$seed"
